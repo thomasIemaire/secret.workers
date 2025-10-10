@@ -300,6 +300,9 @@ def prepare_dataset(
         "document_schema": schema.to_dict() if schema else None,
         "document_vocabulary": vocabulary.to_metadata() if vocabulary else None,
     }
+
+    LOGGER.info(label2id)
+
     return dataset, label2id, id2label, metadata
 
 
