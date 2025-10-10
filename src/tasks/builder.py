@@ -116,7 +116,7 @@ def determine_dataset_size(size_info: Any, max_size: int, formats_count: int) ->
 
     if is_integer(requested):
         value = max(1, int(requested))
-        return min(value, max_size)
+        return value
 
     keyword = str(requested).lower()
     return calculate_size_from_keyword(keyword, max_size, formats_count)
