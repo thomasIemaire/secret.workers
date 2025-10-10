@@ -333,15 +333,11 @@ def compute_metrics(eval_pred: Tuple[np.ndarray, np.ndarray], id2label: Dict[int
         "f1": f1_score(true_labels, true_preds, mode="strict", scheme=IOB2),
     }
 
-    try:
-        import evaluate
-        metric = evaluate.load("seqeval")
-        extra = metric.compute(predictions=true_preds, references=true_labels)
-        for k, v in extra.items():
-            if k not in results:
-                results[k] = v
-    except Exception as e:
-        LOGGER.warning("Impossible de charger le metric 'seqeval' via evaluate: %s", e)
+    metric = evaluate.load("seqeval")
+    seqeval_metrics = metric.compute(predictions=true_preds, references=true_labels)
+    for key, value in seqeval_metrics.items():
+        if key not in results:
+            results[key] = value
 
     LOGGER.debug(
         "Rapport strict:\n%s",
@@ -426,7 +422,7 @@ def trainer(
         len(label2id),
     )
 
-    eval_ratio = _ensure_float(parameters.get("eval_ratio"), 0.2)
+    eval_ratio = _ensure_float(parameters.get("eval_ratio"), 0.0)
     if eval_dataset is None and 0.0 < eval_ratio < 0.5 and len(train_ds) > 10:
         split_seed = _ensure_int(parameters.get("seed"), 42)
         LOGGER.info(
