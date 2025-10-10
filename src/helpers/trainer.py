@@ -224,6 +224,10 @@ def prepare_dataset(
     label2id = {name: i for i, name in enumerate(label_names)}
     id2label = {i: name for name, i in label2id.items()}
 
+    LOGGER.info("Étiquettes utilisées: %s", label_names)
+    LOGGER.info("Mapping des étiquettes: %s", label2id)
+    LOGGER.info("Mapping des étiquettes inversé: %s", id2label)
+
     cleaned_examples, stats = _clean_examples(examples, allowed_labels=label_names)
     if stats:
         LOGGER.info("Nettoyage des données: %s", dict(stats))
