@@ -456,6 +456,11 @@ def trainer(
         label2id=label2id,
     )
 
+    old, new = ner_model.get_input_embeddings().num_embeddings, len(tokenizer)
+    if old != new:
+        LOGGER.info("Redimensionnement des embeddings: %s -> %s", old, new)
+        ner_model.resize_token_embeddings(new)
+
     ner_model = maybe_apply_peft(ner_model, parameters.get("peft"))
 
     collator = DataCollatorForTokenClassification(tokenizer)
@@ -658,6 +663,12 @@ def run_domain_adaptive_pretraining(
     tokenized = corpus.map(tokenize, batched=True, remove_columns=["text"])
 
     mlm_model = CamembertForMaskedLM.from_pretrained(MODEL_NAME)
+
+    old, new = mlm_model.get_input_embeddings().num_embeddings, len(tokenizer)
+    if old != new:
+        LOGGER.info("Redimensionnement des embeddings (MLM): %s -> %s", old, new)
+        mlm_model.resize_token_embeddings(new)
+        
     collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm_probability=_ensure_float(config.get("mlm_probability", 0.15), 0.15),
