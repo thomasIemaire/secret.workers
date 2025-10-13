@@ -506,6 +506,25 @@ def trainer(
     LOGGER.info("Premiers comptes d'étiquettes (50 échantillons): %s", dict(label_stats))
     LOGGER.info("Tokens conservés: %s", kept)
 
+    def _preflight(ds: Dataset, tokenizer_len: int, num_labels: int, name: str) -> None:
+        for i, rec in enumerate(ds):
+            ids = rec["input_ids"]; labs = rec["labels"]; mask = rec["attention_mask"]
+            # shapes cohérentes
+            if not (len(ids) == len(labs) == len(mask)):
+                raise ValueError(f"[{name}] shapes idx={i} -> ids={len(ids)} labs={len(labs)} mask={len(mask)}")
+            # IDs dans [0, tokenizer_len)
+            mi, ma = int(min(ids)), int(max(ids))
+            if mi < 0 or ma >= tokenizer_len:
+                raise ValueError(f"[{name}] input_ids out of range idx={i} min={mi} max={ma} tok_len={tokenizer_len}")
+            # Labels dans {-100} ∪ [0..num_labels-1]
+            eff = [int(x) for x in labs if int(x) != -100]
+            if eff and (min(eff) < 0 or max(eff) >= num_labels):
+                raise ValueError(f"[{name}] label out of range idx={i} min={min(eff)} max={max(eff)} num_labels={num_labels}")
+
+    _preflight(train_ds, tokenizer_len=len(tokenizer), num_labels=len(label2id), name="train")
+    if eval_dataset is not None:
+        _preflight(eval_dataset, tokenizer_len=len(tokenizer), num_labels=len(label2id), name="eval")
+
     trainer_instance = Trainer(
         model=ner_model,
         args=args,
