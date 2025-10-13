@@ -220,6 +220,10 @@ def prepare_dataset(
     schema: Optional[DocumentSchema] = None,
     vocabulary: Optional[DocumentVocabulary] = None,
 ) -> Tuple[Dataset, Dict[str, int], Dict[int, str], Dict[str, Any]]:
+    """Nettoie/encode les exemples et garantit que les input_ids sont toujours dans les bornes
+    du vocab courant (évite les IndexError côté embeddings), tout en étiquetant en BIO.
+    """
+    # 1) Tables de labels (BIO inclus + O)
     label_names = _normalise_labels(label_names)
     label2id = {name: i for i, name in enumerate(label_names)}
     id2label = {i: name for name, i in label2id.items()}
@@ -228,11 +232,22 @@ def prepare_dataset(
     LOGGER.info("Mapping des étiquettes: %s", label2id)
     LOGGER.info("Mapping des étiquettes inversé: %s", id2label)
 
+    # 2) Nettoyage des exemples bruts
     cleaned_examples, stats = _clean_examples(examples, allowed_labels=label_names)
     if stats:
         LOGGER.info("Nettoyage des données: %s", dict(stats))
 
+    # 3) Encodage + alignement BIO + garde-fous
     records: List[MutableMapping[str, Any]] = []
+    vocab_len = len(tokenizer)
+    # Assure qu'on a un unk id utilisable pour le clamp défensif
+    unk_id = tokenizer.unk_token_id
+    if unk_id is None:
+        try:
+            unk_id = tokenizer.convert_tokens_to_ids(tokenizer.unk_token)
+        except Exception:
+            unk_id = 0  # worst-case fallback
+
     for cleaned in cleaned_examples:
         text = cleaned.text
 
@@ -244,13 +259,40 @@ def prepare_dataset(
         )
         offsets = enc.pop("offset_mapping")
 
-        labels = [label2id[O_LABEL]] * len(enc["input_ids"])
+        # ⚠️ Clamp défensif des input_ids dans [0, vocab_len-1]
+        #    -> évite définitivement tout "index out of range in self" côté Embedding
+        raw_ids = enc.get("input_ids", [])
+        if raw_ids:
+            mi, ma = int(min(raw_ids)), int(max(raw_ids))
+            if mi < 0 or ma >= vocab_len:
+                # Log utile pour diagnostiquer (mais on corrige quand même via clamp)
+                try:
+                    bad_tok = tokenizer.convert_ids_to_tokens([ma])[0] if ma >= vocab_len else None
+                except Exception:
+                    bad_tok = None
+                LOGGER.warning(
+                    "input_ids hors bornes détectés (min=%s max=%s, vocab=%s) -> clamp à <unk> (tok=%r)",
+                    mi, ma, vocab_len, bad_tok
+                )
+        enc["input_ids"] = [
+            int(tok) if 0 <= int(tok) < vocab_len else unk_id
+            for tok in raw_ids
+        ]
+
+        # Labels init: 'O' partout
+        seq_len = len(enc["input_ids"])
+        labels = [label2id[O_LABEL]] * seq_len
+
+        # Marque -100 sur les tokens spéciaux/padding (offsets (0,0))
         assigned_labels: List[Optional[str]] = [None] * len(offsets)
         assigned_spans: List[Optional[Tuple[int, int]]] = [None] * len(offsets)
         for i, (start, end) in enumerate(offsets):
             if start == end == 0:
-                labels[i] = -100
+                # Spéciaux -> ignorés par la loss
+                if i < len(labels):
+                    labels[i] = -100
 
+        # Aligne les entités caractère→tokens en BIO (sans chevauchement)
         for start, end, label in cleaned.entities:
             saw_begin = False
             for idx, (tok_start, tok_end) in enumerate(offsets):
@@ -258,39 +300,43 @@ def prepare_dataset(
                     continue
                 if tok_end <= start or tok_start >= end:
                     continue
-                tag = (
-                    f"B-{label}"
-                    if not saw_begin and (tok_start <= start < tok_end)
-                    else f"I-{label}"
-                )
-                if tag in label2id:
-                    previous_label = assigned_labels[idx]
-                    previous_span = assigned_spans[idx]
-                    current_span = (start, end)
-                    if previous_label is not None and (
-                        previous_label != label or previous_span != current_span
-                    ):
-                        previous_desc = (
-                            f"{previous_label} {previous_span}"
-                            if previous_span is not None
-                            else previous_label
-                        )
-                        conflict_desc = f"{label} {current_span}"
-                        raise ValueError(
-                            "Les entités qui se chevauchent ne sont pas supportées : "
-                            f"{previous_desc} vs {conflict_desc} dans l'exemple '{text}'. "
-                            "Le modèle de token classification ne peut encoder qu'une seule étiquette par token."
-                        )
 
-                    assigned_labels[idx] = label
-                    assigned_spans[idx] = current_span
+                tag = f"B-{label}" if (not saw_begin and (tok_start <= start < tok_end)) else f"I-{label}"
+                if tag not in label2id:
+                    # Étiquette inconnue: on ignore proprement (et on trace)
+                    LOGGER.debug("Étiquette inconnue ignorée: %s (label2id=%s)", tag, label2id)
+                    continue
+
+                previous_label = assigned_labels[idx]
+                previous_span = assigned_spans[idx]
+                current_span = (start, end)
+                if previous_label is not None and (previous_label != label or previous_span != current_span):
+                    previous_desc = f"{previous_label} {previous_span}" if previous_span is not None else previous_label
+                    conflict_desc = f"{label} {current_span}"
+                    raise ValueError(
+                        "Les entités qui se chevauchent ne sont pas supportées : "
+                        f"{previous_desc} vs {conflict_desc} dans l'exemple '{text}'. "
+                        "Le modèle de token classification ne peut encoder qu'une seule étiquette par token."
+                    )
+
+                assigned_labels[idx] = label
+                assigned_spans[idx] = current_span
+                if idx < len(labels):
                     labels[idx] = label2id[tag]
-                    saw_begin = True
+                saw_begin = True
 
-        if all(label == -100 for label in labels):
+        # Si vraiment rien à apprendre (que des spéciaux), on saute l'exemple
+        if all(lbl == -100 for lbl in labels):
             continue
 
-        enc["labels"] = [int(value) for value in labels]
+        # ⚑ Sécurité supplémentaire : bornage dur des labels (ne devrait jamais déclencher)
+        num_labels = len(label2id)
+        labels = [
+            int(l) if (int(l) == -100 or 0 <= int(l) < num_labels) else label2id[O_LABEL]
+            for l in labels
+        ]
+
+        enc["labels"] = labels
         records.append(enc)
 
     if not records:
@@ -306,7 +352,6 @@ def prepare_dataset(
     }
 
     LOGGER.info(label2id)
-
     return dataset, label2id, id2label, metadata
 
 
