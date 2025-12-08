@@ -1,5 +1,3 @@
-"""Training task orchestration."""
-
 from __future__ import annotations
 
 import json
@@ -27,6 +25,7 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
     data_collection = db.get_collection("datasets_data")
     models = db.get_collection("models")
     agents = db.get_collection("agents")
+    configs = db.get_collection("models_configurations")
 
     dataset_id = doc.get("_id")
     if not dataset_id:
@@ -46,7 +45,7 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
         if not dataset:
             raise ValueError("Dataset vide: impossible d'entraîner le modèle")
 
-        model_id = doc.get("model")
+        model_id = doc.get("model") or doc.get("model_id")
         if not model_id:
             raise ValueError("model_id manquant")
         if not isinstance(model_id, ObjectId):
@@ -56,12 +55,29 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
         if not model:
             raise ValueError(f"Modèle introuvable: {model_id}")
 
+        # --- CORRECTION ---
+        # Si le modèle n'a pas d'étiquettes, on tente de les récupérer depuis la configuration
+        if not model.get("labels") and not model.get("mapper"):
+            LOGGER.info("Aucune étiquette dans le modèle, tentative d'inférence depuis la configuration...")
+            config_id = doc.get("configuration") or model.get("configuration")
+            if config_id:
+                if not isinstance(config_id, ObjectId):
+                    config_id = ObjectId(config_id)
+                configuration = configs.find_one({"_id": config_id})
+                if configuration:
+                    attributes = configuration.get("attributes") or []
+                    inferred_labels = [attr.get("key") for attr in attributes if attr.get("key")]
+                    if inferred_labels:
+                        model["labels"] = inferred_labels
+                        LOGGER.info("Etiquettes inférées: %s", inferred_labels)
+        # ------------------
+
         version = doc.get("version", "1.0")
         parameters = doc.get("parameters") or {}
 
         datasets.update_one(
             {"_id": dataset_id},
-            {"$set": {"status": "training", "started_at": datetime.utcnow()}},
+            {"$set": {"status": "in-training", "started_at": datetime.utcnow()}},
         )
         LOGGER.info(
             "[%s] lancement de l'entraînement du modèle %s (version %s) avec %s exemples",
@@ -80,7 +96,8 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
             {"$set": {"status": "completed", "finished_at": datetime.utcnow()}},
         )
 
-        target_path = Path("sardine.agents") / doc.get("reference", "agent") / version
+        # MODIFICATION ICI : Utilisation de .resolve() pour obtenir le chemin absolu
+        target_path = (Path("sardine.agents") / doc.get("reference", "agent") / version).resolve()
 
         descriptor_data: dict[str, Any] = {}
         descriptor_path = target_path / "agent.json"
@@ -115,13 +132,14 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
 
         cleanup_checkpoints(target_path)
         LOGGER.info("[%s] entraînement terminé", job_id)
-    except Exception as exc:  # pragma: no cover - defensive logging
+
+    except Exception as exc:
         error_message = "".join(traceback.format_exception_only(type(exc), exc)).strip()
         datasets.update_one(
             {"_id": dataset_id},
             {
                 "$set": {
-                    "status": "failed",
+                    "status": "train-failed",
                     "error": error_message,
                     "finished_at": datetime.utcnow(),
                 }

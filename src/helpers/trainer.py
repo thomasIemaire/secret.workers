@@ -1,5 +1,3 @@
-"""Training utilities for sequence tagging models."""
-
 from __future__ import annotations
 
 import json
@@ -10,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from xml.parsers.expat import model
 
 import evaluate
 import numpy as np
@@ -46,7 +45,7 @@ except ImportError:  # pragma: no cover - optional dependency
     PEFT_AVAILABLE = False
 
 LOGGER = logging.getLogger(__name__)
-MODEL_NAME = "camembert-base"
+MODEL_NAME = "camembert/camembert-large"
 MAX_SEQ_LENGTH = 512
 O_LABEL = "O"
 
@@ -58,6 +57,9 @@ class CleanedExample:
     text: str
     entities: List[Tuple[int, int, str]]
     original: Mapping[str, Any]
+    # --- MODIFICATION: Ajout des champs pour les données pré-tokenisées ---
+    tokens: Optional[List[str]] = None
+    ner_tags: Optional[List[str]] = None
 
 
 def _normalise_labels(label_names: Sequence[str]) -> List[str]:
@@ -160,6 +162,11 @@ def _clean_examples(
             stats["empty_text"] += 1
             continue
 
+        # --- MODIFICATION: Récupération des tokens pré-calculés ---
+        pre_tokens = data.get("tokens")
+        pre_ner_tags = data.get("ner_tags")
+        # --------------------------------------------------------
+
         normalised_text = " ".join(text.split())
         entities = data.get("entities") or []
         cleaned_entities: List[Tuple[int, int, str]] = []
@@ -203,11 +210,19 @@ def _clean_examples(
         seen_examples.add(dedup_key)
 
         cleaned.append(
-            CleanedExample(text=normalised_text, entities=cleaned_entities, original=example)
+            CleanedExample(
+                text=normalised_text,
+                entities=cleaned_entities,
+                original=example,
+                # --- MODIFICATION: Passage des tokens ---
+                tokens=pre_tokens,
+                ner_tags=pre_ner_tags
+            )
         )
 
-        if not cleaned_entities:
-            stats["no_entities"] += 1
+        if not cleaned_entities and not pre_ner_tags:
+            # On conserve explicitement les exemples sans entités (négatifs)
+            stats["negative_examples"] += 1
 
     return cleaned, stats
 
@@ -249,6 +264,38 @@ def prepare_dataset(
             unk_id = 0  # worst-case fallback
 
     for cleaned in cleaned_examples:
+        # --- MODIFICATION: Gestion des données pré-tokenisées ---
+        if cleaned.tokens and cleaned.ner_tags:
+            # Conversion directe des tokens en IDs
+            input_ids = tokenizer.convert_tokens_to_ids(cleaned.tokens)
+            
+            # Conversion des tags BIO en IDs de labels
+            # Utilisation de O_LABEL par défaut pour la robustesse
+            labels = [
+                label2id.get(tag, label2id[O_LABEL]) 
+                for tag in cleaned.ner_tags
+            ]
+            
+            # Construction de l'encodage
+            enc = {
+                "input_ids": input_ids,
+                "attention_mask": [1] * len(input_ids),
+                "labels": labels
+            }
+            
+            # Troncature de sécurité si nécessaire
+            if len(input_ids) > MAX_SEQ_LENGTH:
+                enc["input_ids"] = enc["input_ids"][:MAX_SEQ_LENGTH]
+                enc["attention_mask"] = enc["attention_mask"][:MAX_SEQ_LENGTH]
+                enc["labels"] = enc["labels"][:MAX_SEQ_LENGTH]
+                # Token de fin propre si possible
+                if tokenizer.sep_token_id is not None:
+                     enc["input_ids"][-1] = tokenizer.sep_token_id
+
+            records.append(enc)
+            continue 
+        # -------------------------------------------------------
+
         text = cleaned.text
 
         enc = tokenizer(
@@ -342,6 +389,12 @@ def prepare_dataset(
     if not records:
         raise ValueError("Dataset vide après parsing")
 
+    # Log pour confirmer la composition du dataset (positifs vs négatifs)
+    o_id = label2id.get(O_LABEL, 0)
+    positives = sum(1 for r in records if any(l != -100 and l != o_id for l in r["labels"]))
+    negatives = len(records) - positives
+    LOGGER.info("Composition finale: %d exemples positifs (avec entités), %d exemples négatifs (sans entités)", positives, negatives)
+
     dataset = Dataset.from_list(records)
     metadata = {
         "texts": [example.text for example in cleaned_examples],
@@ -385,7 +438,7 @@ def compute_metrics(eval_pred: Tuple[np.ndarray, np.ndarray], id2label: Dict[int
             results[key] = value
 
     LOGGER.debug(
-        "Rapport strict:\n%s",
+        "Rapport strict:\\n%s",
         classification_report(true_labels, true_preds, mode="strict", scheme=IOB2, digits=4),
     )
 
@@ -417,12 +470,48 @@ def trainer(
     schema = DocumentSchema.from_mapping(mapper_spec)
 
     raw_label_names = list(model.get("labels") or [])
+    
     if not raw_label_names and schema.entity_labels():
         generated = []
         for label in schema.entity_labels():
             generated.append(f"B-{label}")
             generated.append(f"I-{label}")
         raw_label_names = [O_LABEL, *generated]
+
+    if not raw_label_names:
+        LOGGER.info("Aucune étiquette dans le modèle/schéma, inférence automatique depuis le dataset...")
+        found_labels = set()
+        for example in dataset:
+            data = example.get("data") or {}
+            # --- MODIFICATION: Support des tags pré-calculés ---
+            if "ner_tags" in data:
+                for tag in data["ner_tags"]:
+                    if tag.upper().startswith(("B-", "I-")):
+                        parts = tag.split("-", 1)
+                        if len(parts) > 1:
+                            found_labels.add(parts[1])
+            # -------------------------------------------------
+            else:
+                entities = data.get("entities") or []
+                for entity in entities:
+                    if len(entity) >= 3:
+                        label = str(entity[2]).strip()
+                        if label.upper().startswith(("B-", "I-")):
+                            parts = label.split("-", 1)
+                            if len(parts) > 1:
+                                label = parts[1]
+                        if label:
+                            found_labels.add(label)
+        
+        if found_labels:
+            generated = []
+            for label in sorted(found_labels):
+                generated.append(f"B-{label}")
+                generated.append(f"I-{label}")
+            raw_label_names = [O_LABEL, *generated]
+            LOGGER.info("Étiquettes inférées: %s", raw_label_names)
+    
+    print(raw_label_names)
 
     label_names = _normalise_labels(raw_label_names)
     if len(label_names) <= 1:
@@ -467,7 +556,7 @@ def trainer(
         len(label2id),
     )
 
-    eval_ratio = _ensure_float(parameters.get("eval_ratio"), 0.0)
+    eval_ratio = _ensure_float(parameters.get("eval_ratio"), 0.2)
     if eval_dataset is None and 0.0 < eval_ratio < 0.5 and len(train_ds) > 10:
         split_seed = _ensure_int(parameters.get("seed"), 42)
         LOGGER.info(
@@ -523,21 +612,30 @@ def trainer(
         per_device_train_batch_size=_ensure_int(parameters.get("batch_size"), 16),
         num_train_epochs=_ensure_float(parameters.get("epochs"), 5),
         weight_decay=_ensure_float(parameters.get("weight_decay"), 0.01),
+        
+        # --- CORRECTION CRITIQUE ---
+        # Pour que load_best_model_at_end fonctionne, save et eval doivent être identiques.
+        # Avec un dataset de 1000 entrées, "epoch" est plus propre que "steps".
         save_strategy="epoch",
-        evaluation_strategy=(
-            "no"
-            if eval_dataset is None
-            else str(parameters.get("eval_strategy", "epoch"))
-        ),
+        eval_strategy="epoch", 
+        # ---------------------------
+
         logging_dir=str(logging_dir),
+        # On garde le logging fréquent pour voir la progression
         logging_steps=_ensure_int(parameters.get("logging_steps", 10), 10),
+        
         fp16=use_fp16,
         gradient_accumulation_steps=_ensure_int(parameters.get("grad_accum"), 1),
         group_by_length=True,
         dataloader_pin_memory=False,
-        warmup_ratio=warmup_ratio,
+        
+        # Attention: généralement on utilise soit ratio, soit steps, pas les deux. 
+        # Assurez-vous que l'une des variables est None ou 0 si l'autre est utilisée.
+        warmup_ratio=warmup_ratio, 
         warmup_steps=warmup_steps,
+        
         lr_scheduler_type=lr_scheduler_type,
+        
         load_best_model_at_end=_ensure_bool(
             parameters.get("load_best_model"), eval_dataset is not None
         ),
@@ -554,13 +652,16 @@ def trainer(
     def _preflight(ds: Dataset, tokenizer_len: int, num_labels: int, name: str) -> None:
         for i, rec in enumerate(ds):
             ids = rec["input_ids"]; labs = rec["labels"]; mask = rec["attention_mask"]
+            
             # shapes cohérentes
             if not (len(ids) == len(labs) == len(mask)):
                 raise ValueError(f"[{name}] shapes idx={i} -> ids={len(ids)} labs={len(labs)} mask={len(mask)}")
+            
             # IDs dans [0, tokenizer_len)
             mi, ma = int(min(ids)), int(max(ids))
             if mi < 0 or ma >= tokenizer_len:
                 raise ValueError(f"[{name}] input_ids out of range idx={i} min={mi} max={ma} tok_len={tokenizer_len}")
+            
             # Labels dans {-100} ∪ [0..num_labels-1]
             eff = [int(x) for x in labs if int(x) != -100]
             if eff and (min(eff) < 0 or max(eff) >= num_labels):

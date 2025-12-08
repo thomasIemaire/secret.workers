@@ -1,16 +1,14 @@
-"""Dataset generation task."""
-
-from __future__ import annotations
-
 import logging
 import random
 import re
+import math
 from collections.abc import Iterable, Mapping
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import rstr
 from bson import ObjectId
+from transformers import AutoTokenizer
 
 LOGGER = logging.getLogger(__name__)
 PLACEHOLDER_PATTERN = re.compile(r"\{(?P<key>[^:{}]+)(?::[^{}]*)?\}")
@@ -45,7 +43,7 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
     if not isinstance(dataset_id, ObjectId):
         dataset_id = ObjectId(dataset_id)
 
-    model_id = doc.get("model")
+    model_id = doc.get("model") or doc.get("model_id")
     if not model_id:
         raise ValueError("Model configuration is missing")
 
@@ -56,7 +54,7 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
     if not model:
         raise ValueError(f"Model introuvable: {model_id}")
 
-    configuration_id = model.get("configuration")
+    configuration_id = model.get("configuration") or doc.get("configuration")
     if not configuration_id:
         raise ValueError("Model configuration is missing")
 
@@ -67,26 +65,66 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
     if not configuration:
         raise ValueError(f"Configuration introuvable: {configuration_id}")
 
+    negative_config_ids = configuration.get("negative_configurations") or []
+    negative_configurations = []
+    if negative_config_ids:
+        negative_ids = [ObjectId(nid) for nid in negative_config_ids if nid]
+        if negative_ids:
+            negative_configurations = list(configs.find({"_id": {"$in": negative_ids}}))
+            LOGGER.info(f"Chargement de {len(negative_configurations)} configurations de bruit (négatives).")
+
     entity_keys = list((model.get("entities") or {}).keys())
+    
+    if not entity_keys and configuration:
+        LOGGER.info("Aucune entité définie dans le modèle, utilisation des attributs de la configuration.")
+        attributes = configuration.get("attributes") or []
+        entity_keys = [attr.get("key") for attr in attributes if attr.get("key")]
+
     randomizers = model.get("randomizers") or []
-    builder = DatasetBuilder(configuration=configuration, db=db, entity_keys=entity_keys, randomizers=randomizers)
+
+    tokenizer_path = "camembert/camembert-large"
+    tokenizer = None
+    if tokenizer_path:
+        try:
+            LOGGER.info(f"Chargement du tokenizer depuis: {tokenizer_path}")
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
+        except Exception as e:
+            LOGGER.warning(f"Impossible de charger le tokenizer: {e}. La génération se fera sans tokens.")
+
+    builder = DatasetBuilder(
+        configuration=configuration, 
+        db=db, 
+        entity_keys=entity_keys, 
+        randomizers=randomizers,
+        tokenizer=tokenizer,
+        negative_configurations=negative_configurations
+    )
     dataset_requirements = builder.requirements
 
-    size_info = doc.get("size", {})
+    train_params = doc.get("parameters") or {}
+    size_info = train_params.get("dataset_size", 1000)
+    
+    negative_ratio = float(train_params.get("negative_ratio", 0.0))
+    negative_ratio = max(0.0, min(1.0, negative_ratio))
+
     max_possibilities = int(configuration.get("possibilities", 1e5))
     formats_count = len(configuration.get("formats") or [])
     dataset_size = determine_dataset_size(size_info, max_possibilities, formats_count)
 
-    LOGGER.info("builder[%s]: génération de %s entrées", dataset_id, dataset_size)
+    LOGGER.info("builder[%s]: génération de %s entrées (Ratio négatif: %.2f)", dataset_id, dataset_size, negative_ratio)
     datasets.update_one(
         {"_id": dataset_id},
-        {"$set": {"status": "generating", "progress": 0.0, "requirements": dataset_requirements}},
+        {"$set": {"status": "in-building", "progress": 0.0, "requirements": dataset_requirements}},
     )
 
     samples: List[Dict[str, Any]] = []
     update_interval = max(1, dataset_size // 100)
+    
     for index in range(dataset_size):
-        samples.append(builder.generate_sample())
+        should_be_negative = (random.random() < negative_ratio) and (len(negative_configurations) > 0)
+        
+        samples.append(builder.generate_sample(is_negative=should_be_negative))
+        
         if (index + 1) % update_interval == 0 or index + 1 == dataset_size:
             progress = (index + 1) / dataset_size
             datasets.update_one({"_id": dataset_id}, {"$set": {"progress": progress}})
@@ -103,7 +141,7 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
 
     datasets.update_one(
         {"_id": dataset_id},
-        {"$set": {"status": "generated", "progress": 0.0}},
+        {"$set": {"status": "to-validate", "progress": 1.0}},
     )
 
 
@@ -146,14 +184,22 @@ class DatasetBuilder:
         db,
         entity_keys: Sequence[str],
         randomizers: Sequence[Mapping[str, Any]],
+        tokenizer=None,
+        negative_configurations: Optional[List[Mapping[str, Any]]] = None
     ) -> None:
         self.configuration = configuration
         self.db = db
         self.entity_keys = list(entity_keys)
         self.randomizers = list(randomizers)
+        self.tokenizer = tokenizer
+        self.negative_configurations = negative_configurations or []
+        
         self.requirements_map: Dict[str, List[Mapping[str, Any]]] = {}
         self._visited_config_ids: Set[str] = set()
+        
         self._collect_requirements(self.configuration)
+        for neg_conf in self.negative_configurations:
+            self._collect_requirements(neg_conf)
 
     @property
     def requirements(self) -> Dict[str, List[Mapping[str, Any]]]:
@@ -162,13 +208,167 @@ class DatasetBuilder:
             for key, requirements in self.requirements_map.items()
         }
 
-    def generate_sample(self) -> Dict[str, Any]:
-        built_config = self._build_configuration(self.configuration)
-        template = built_config["template"]
-        attributes = built_config["attributes"]
-        resolved_text, entities = self._render_entity(template, attributes)
+    def generate_sample(self, is_negative: bool = False) -> Dict[str, Any]:
+        target_config = self.configuration
+        if is_negative and self.negative_configurations:
+            target_config = random.choice(self.negative_configurations)
+
+        context: Dict[str, Any] = {}
+
+        constants = target_config.get("constants") or []
+        for const_def in constants:
+            const_key = const_def.get("key")
+            if not const_key:
+                continue
+            
+            val, _ = self._build_dynamic_value(const_def.get("value"), context=context)
+            val = coerce_type(const_def.get("type", "string"), val)
+            context[const_key] = val
+
+        template = random.choice(target_config.get("formats") or [""])
+        attributes_defs = target_config.get("attributes") or []
+        built_attributes: List[Dict[str, Any]] = []
+
+        for attr_def in attributes_defs:
+            built_attr, extra_attrs = self._build_attribute(attr_def, context)
+            
+            if built_attr.get("key"):
+                context[built_attr["key"]] = built_attr.get("value")
+                
+            built_attributes.append(built_attr)
+            built_attributes.extend(extra_attrs)
+
+        resolved_text, entities = self._render_entity(template, built_attributes)
+        
         resolved_text = self._apply_randomizer(resolved_text)
-        return {"text": resolved_text.strip(), "entities": entities}
+        
+        if is_negative:
+            entities = []
+        
+        result = {"text": resolved_text.strip(), "entities": entities}
+        
+        if self.tokenizer:
+            tokenized_data = self._tokenize_and_align(result["text"], result["entities"])
+            result.update(tokenized_data)
+            
+        return result
+
+    def _build_attribute(self, attribute: Mapping[str, Any], context: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        key = attribute.get("key")
+        frequency = float(attribute.get("frequency", 1))
+        include = random.random() <= frequency
+        requirements = normalize_requirements(attribute.get("requirements"))
+
+        value_spec = attribute.get("value") if include else None
+        extra_attrs: List[Dict[str, Any]] = []
+        value: Any = ""
+
+        if isinstance(value_spec, Mapping):
+            value, extra_attrs = self._build_dynamic_value(value_spec, context)
+        elif value_spec is not None:
+            value = value_spec
+
+        value = coerce_type(attribute.get("type", "string"), value)
+
+        attribute_payload: Dict[str, Any] = {"key": key, "value": "" if value is None else value}
+        if requirements:
+            attribute_payload["requirements"] = requirements
+
+        return attribute_payload, extra_attrs
+
+    def _build_dynamic_value(self, spec: Mapping[str, Any], context: Dict[str, Any]) -> Tuple[Any, List[Dict[str, Any]]]:
+        value_type = spec.get("type", "string")
+        rule = spec.get("rule")
+        parameters = spec.get("parameters") or {}
+
+        match rule:
+            case "constant":
+                const_key = parameters.get("const_key")
+                # On récupère la valeur depuis le contexte généré
+                if const_key and const_key in context:
+                    val = context[const_key]
+                    return coerce_type(value_type, val), []
+                return "", []
+
+            case "calculation":
+                formula = parameters.get("formula", "")
+                if not formula:
+                    return "", []
+                try:
+                    safe_globals = {
+                        "__builtins__": None,
+                        "math": math,
+                        "int": int,
+                        "float": float,
+                        "str": str,
+                        "round": round,
+                        "abs": abs,
+                        "min": min,
+                        "max": max
+                    }
+                    eval_context = {**safe_globals, **context}
+                    
+                    value = eval(formula, eval_context)
+                    return coerce_type(value_type, value), []
+                except Exception as e:
+                    LOGGER.warning(f"Erreur lors du calcul de la formule '{formula}': {e}")
+                    return "", []
+
+            case "randint":
+                minimum = int(parameters.get("min", 0))
+                maximum = int(parameters.get("max", 100))
+                if minimum > maximum:
+                    minimum, maximum = maximum, minimum
+                value = random.randint(minimum, maximum)
+                return coerce_type(value_type, value), []
+
+            case "alphanumeric":
+                regex = parameters.get("constraint", "")
+                value = rstr.xeger(regex) if regex else ""
+                return coerce_type(value_type, value), []
+
+            case "data":
+                data_id = parameters.get("object_id")
+                if data_id:
+                    record = self.db.get_collection("models_data").find_one({"_id": ObjectId(data_id)})
+                    if record and record.get("data"):
+                        value = random.choice(record["data"])
+                        return coerce_type(value_type, value), []
+                return "", []
+
+            case "configuration":
+                config_id = parameters.get("object_id")
+                if config_id:
+                    nested = self.db.get_collection("models_configurations").find_one({"_id": ObjectId(config_id)})
+                    if nested:
+                        built = self._build_configuration(nested)
+                        return built.get("template", ""), built.get("attributes", [])
+                return "", []
+
+            case _:
+                return "", []
+
+    def _build_configuration(self, configuration: Mapping[str, Any]) -> Dict[str, Any]:
+        template = random.choice(configuration.get("formats") or [""])
+        attributes = configuration.get("attributes") or []
+        built_attributes: List[Dict[str, Any]] = []
+        
+        local_context = {}
+        constants = configuration.get("constants") or []
+        for const_def in constants:
+            key = const_def.get("key")
+            if key:
+                val, _ = self._build_dynamic_value(const_def.get("value"), context=local_context)
+                local_context[key] = coerce_type(const_def.get("type"), val)
+
+        for attribute in attributes:
+            built_attr, extra_attrs = self._build_attribute(attribute, local_context)
+            if built_attr.get("key"):
+                local_context[built_attr["key"]] = built_attr.get("value")
+            built_attributes.append(built_attr)
+            built_attributes.extend(extra_attrs)
+
+        return {"template": re.sub(r"\s+", " ", template.strip()), "attributes": built_attributes}
 
     def _collect_requirements(self, configuration: Mapping[str, Any]) -> None:
         config_identifier = configuration.get("_id")
@@ -208,7 +408,7 @@ class DatasetBuilder:
         if config_id is None:
             return
 
-        object_id: Optional[ObjectId]
+        object_id: Optional[ObjectId] = None
         if isinstance(config_id, ObjectId):
             object_id = config_id
         else:
@@ -217,94 +417,24 @@ class DatasetBuilder:
             except Exception:
                 return
 
-        identifier_str = str(object_id)
-        if identifier_str in self._visited_config_ids:
-            return
-
-        nested = self.db.get_collection("models_configurations").find_one({"_id": object_id})
-        if nested:
-            self._collect_requirements(nested)
-
-    def _build_configuration(self, configuration: Mapping[str, Any]) -> Dict[str, Any]:
-        template = random.choice(configuration.get("formats") or [""])
-        attributes = configuration.get("attributes") or []
-        built_attributes: List[Dict[str, Any]] = []
-
-        for attribute in attributes:
-            built_attr, extra_attrs = self._build_attribute(attribute)
-            built_attributes.append(built_attr)
-            built_attributes.extend(extra_attrs)
-
-        return {"template": re.sub(r"\s+", " ", template.strip()), "attributes": built_attributes}
-
-    def _build_attribute(self, attribute: Mapping[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        key = attribute.get("key")
-        frequency = float(attribute.get("frequency", 1))
-        include = random.random() <= frequency
-        requirements = normalize_requirements(attribute.get("requirements"))
-
-        value_spec = attribute.get("value") if include else None
-        extra_attrs: List[Dict[str, Any]] = []
-        value: Any = ""
-
-        if isinstance(value_spec, Mapping):
-            value, extra_attrs = self._build_dynamic_value(value_spec)
-        elif value_spec is not None:
-            value = value_spec
-
-        attribute_payload: Dict[str, Any] = {"key": key, "value": "" if value is None else value}
-        if requirements:
-            attribute_payload["requirements"] = requirements
-
-        return attribute_payload, extra_attrs
-
-    def _build_dynamic_value(self, spec: Mapping[str, Any]) -> Tuple[Any, List[Dict[str, Any]]]:
-        value_type = spec.get("type", "string")
-        rule = spec.get("rule")
-        parameters = spec.get("parameters") or {}
-
-        match rule:
-            case "randint":
-                minimum = int(parameters.get("min", 0))
-                maximum = int(parameters.get("max", 100))
-                if minimum > maximum:
-                    minimum, maximum = maximum, minimum
-                value = random.randint(minimum, maximum)
-                return coerce_type(value_type, value), []
-            case "alphanum":
-                regex = parameters.get("regex", "")
-                value = rstr.xeger(regex) if regex else ""
-                return coerce_type(value_type, value), []
-            case "data":
-                data_id = parameters.get("object_id")
-                if data_id:
-                    record = self.db.get_collection("models_data").find_one({"_id": ObjectId(data_id)})
-                    if record and record.get("data"):
-                        value = random.choice(record["data"])
-                        return coerce_type(value_type, value), []
-                return "", []
-            case "configuration":
-                config_id = parameters.get("object_id")
-                if config_id:
-                    nested = self.db.get_collection("models_configurations").find_one({"_id": ObjectId(config_id)})
-                    if nested:
-                        built = self._build_configuration(nested)
-                        return built.get("template", ""), built.get("attributes", [])
-                return "", []
-            case _:
-                return "", []
+        if object_id:
+            nested = self.db.get_collection("models_configurations").find_one({"_id": object_id})
+            if nested:
+                self._collect_requirements(nested)
 
     def _check_requirements(self, value: Any, requirements: Iterable[Mapping[str, Any]]) -> bool:
         for requirement in requirements or []:
             rule = requirement.get("rule")
             constraint = requirement.get("constraint")
             try:
+                val_str = str(value)
+                const_str = str(constraint)
                 if rule == "regex":
-                    if not re.match(str(constraint), str(value)):
+                    if not re.match(const_str, val_str):
                         return False
-                elif rule == "eq" and str(value) != str(constraint):
+                elif rule == "eq" and val_str != const_str:
                     return False
-                elif rule == "neq" and str(value) == str(constraint):
+                elif rule == "neq" and val_str == const_str:
                     return False
                 elif rule == "gt" and float(value) <= float(constraint):
                     return False
@@ -315,14 +445,14 @@ class DatasetBuilder:
                 elif rule == "lte" and float(value) > float(constraint):
                     return False
                 elif rule == "in":
-                    if str(value) not in split_constraint(constraint):
+                    if val_str not in split_constraint(constraint):
                         return False
                 elif rule == "nin":
-                    if str(value) in split_constraint(constraint):
+                    if val_str in split_constraint(constraint):
                         return False
-                elif rule == "contains" and str(constraint) not in str(value):
+                elif rule == "contains" and const_str not in val_str:
                     return False
-                elif rule == "ncontains" and str(constraint) in str(value):
+                elif rule == "ncontains" and const_str in val_str:
                     return False
             except Exception:
                 return False
@@ -350,9 +480,6 @@ class DatasetBuilder:
                 return result
 
             if key in stack:
-                attr["requirements_met"] = self._check_requirements(
-                    "", attr.get("requirements")
-                )
                 result = {"text": "", "entities": []}
                 resolved_values[key] = result
                 return result
@@ -392,6 +519,7 @@ class DatasetBuilder:
                 offset += len(tail)
 
             resolved = "".join(parts)
+            
             attr["requirements_met"] = self._check_requirements(
                 resolved, attr.get("requirements")
             )
@@ -421,29 +549,53 @@ class DatasetBuilder:
             end = start + len(value)
 
             if key in self.entity_keys and value and requirements_met:
-                entities.append([start, end, key])
+                entities.append([start, end, f"B-{key}"])
 
             for nested_start, nested_end, nested_key in value_info.get("entities", []):
                 absolute_start = start + nested_start
                 absolute_end = start + nested_end
                 if absolute_end <= absolute_start:
                     continue
+                
                 nested_attr = attr_map.get(nested_key)
                 nested_requirements_met = (
                     True if nested_attr is None else nested_attr.get("requirements_met", True)
                 )
+                
                 if nested_key in self.entity_keys and nested_requirements_met:
-                    entities.append([absolute_start, absolute_end, nested_key])
+                    entities.append([absolute_start, absolute_end, f"B-{nested_key}"])
 
             cursor = end
             parts.append(value)
             last_index = match.end()
 
         parts.append(template[last_index:])
-        cursor += len(template[last_index:])
-
         final_text = "".join(parts)
+        
         return final_text, entities
+
+    def _tokenize_and_align(self, text: str, entities: List[List[Any]]) -> Dict[str, Any]:
+        encoding = self.tokenizer(text, return_offsets_mapping=True, add_special_tokens=True)
+        tokens = encoding.tokens()
+        offsets = encoding["offset_mapping"]
+        
+        ner_tags = ["O"] * len(tokens)
+        entities.sort(key=lambda x: x[0])
+        
+        for start_char, end_char, label in entities:
+            entity_type = label.replace("B-", "").replace("I-", "")
+            found_start = False
+            for idx, (token_start, token_end) in enumerate(offsets):
+                if token_start == 0 and token_end == 0:
+                    continue
+                if token_start >= start_char and token_end <= end_char:
+                    if not found_start:
+                        ner_tags[idx] = f"B-{entity_type}"
+                        found_start = True
+                    else:
+                        ner_tags[idx] = f"I-{entity_type}"
+                        
+        return {"tokens": tokens, "ner_tags": ner_tags}
 
     def _apply_randomizer(self, text: str) -> str:
         if not self.randomizers:
@@ -465,10 +617,12 @@ def coerce_type(value_type: str, value: Any) -> Any:
         return None
     if value_type == "number":
         try:
-            return int(value)
+            return int(float(value)) if "." not in str(value) else float(value)
         except (TypeError, ValueError):
             return value
-    return str(value)
+    if value_type == "string":
+        return str(value)
+    return value
 
 
 def split_constraint(constraint: Any) -> List[str]:
@@ -485,10 +639,3 @@ def is_integer(value: Any) -> bool:
         return True
     except (ValueError, TypeError):
         return False
-
-
-def bump_version(version: str, bump: str) -> str:
-    major, minor = map(int, version.split("."))
-    if bump == "major":
-        return f"{major + 1}.0"
-    return f"{major}.{minor + 1}"

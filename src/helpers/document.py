@@ -1,11 +1,3 @@
-"""Domain-specific helpers for document extraction agents.
-
-This module introduces a structured way to describe document fields, build
-domain vocabularies and map model predictions to JSON data structures. It
-provides building blocks to assemble specialised "agents" that can later be
-combined to cover complete document understanding workflows.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -470,7 +462,8 @@ class DocumentVocabulary:
         "pays",
     ]
 
-    TOKEN_PATTERN = re.compile(r"[\w\-']+", re.UNICODE)
+    # Modification de la regex pour ne PLUS inclure le tiret
+    TOKEN_PATTERN = re.compile(r"[\w']+", re.UNICODE)
 
     def __init__(
         self,
@@ -628,4 +621,3 @@ class CompositeAgent:
 def save_descriptor(path: Any, descriptor: Mapping[str, Any]) -> None:
     target = Path(path)
     target.write_text(json.dumps(descriptor, indent=2, ensure_ascii=False), encoding="utf-8")
-

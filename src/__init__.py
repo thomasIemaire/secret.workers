@@ -65,7 +65,7 @@ def main() -> None:
     workers = [
         Worker(
             "builder",
-            lambda: claim_one_status("empty", "generating"),
+            lambda: claim_one_status("to-build", "in-building"),
             run_builder,
             MAX_WORKERS_BUILDER,
             POLL_DELAY,
@@ -74,7 +74,7 @@ def main() -> None:
         ).start(),
         Worker(
             "trainer",
-            lambda: claim_one_status("ready", "training"),
+            lambda: claim_one_status("to-train", "in-training"),
             run_trainer,
             MAX_WORKERS_TRAINER,
             POLL_DELAY,
