@@ -82,7 +82,9 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
 
     randomizers = model.get("randomizers") or []
 
-    tokenizer_path = "camembert/camembert-large"
+    train_params = doc.get("parameters") or {}
+
+    tokenizer_path = train_params.get("base_model", "camembert/camembert-base")
     tokenizer = None
     if tokenizer_path:
         try:
@@ -101,7 +103,6 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
     )
     dataset_requirements = builder.requirements
 
-    train_params = doc.get("parameters") or {}
     size_info = train_params.get("dataset_size", 1000)
     
     negative_ratio = float(train_params.get("negative_ratio", 0.0))

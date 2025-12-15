@@ -466,6 +466,9 @@ def trainer(
         raise ValueError("Dataset vide: aucune donnée à entraîner")
 
     parameters = parameters or {}
+
+    print(f"Paramètres d'entraînement: {parameters}")
+
     mapper_spec = model.get("mapper")
     schema = DocumentSchema.from_mapping(mapper_spec)
 
@@ -520,7 +523,7 @@ def trainer(
     model_reference = model.get("reference", "model")
     resolved_version = version or model.get("version", "1.0")
 
-    base_model_name = str(model.get("base_model") or MODEL_NAME)
+    base_model_name = str(parameters.get("base_model") or MODEL_NAME)
     tokenizer = CamembertTokenizerFast.from_pretrained(base_model_name)
 
     additional_terms = model.get("vocabulary") or []
