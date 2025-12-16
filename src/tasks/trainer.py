@@ -11,7 +11,7 @@ from typing import Any, Mapping, Optional
 
 from bson import ObjectId
 
-from src.helpers.trainer import trainer as run_trainer
+from src.helpers.trainer import train_with_gliner
 
 LOGGER = logging.getLogger(__name__)
 
@@ -77,7 +77,13 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
 
         datasets.update_one(
             {"_id": dataset_id},
-            {"$set": {"status": "in-training", "started_at": datetime.utcnow()}},
+            {
+                "$set": {
+                    "status": "in-training",
+                    "started_at": datetime.utcnow(),
+                    "training_parameters": parameters,
+                }
+            },
         )
         LOGGER.info(
             "[%s] lancement de l'entraînement du modèle %s (version %s) avec %s exemples",
@@ -87,9 +93,18 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
             len(dataset),
         )
 
-        run_trainer(dataset, model, parameters=parameters, version=version)
+        _, output_dir = train_with_gliner(
+            dataset,
+            model,
+            parameters=parameters,
+            version=version,
+            db=db,
+            dataset_id=dataset_id,
+        )
 
-        data_collection.delete_many({"dataset": dataset_id})
+        preserve_dataset = parameters.get("preserve_dataset", True)
+        if not preserve_dataset:
+            data_collection.delete_many({"dataset": dataset_id})
 
         datasets.update_one(
             {"_id": dataset_id},
@@ -97,7 +112,11 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
         )
 
         # MODIFICATION ICI : Utilisation de .resolve() pour obtenir le chemin absolu
-        target_path = (Path("sardine.agents") / doc.get("reference", "agent") / version).resolve()
+        target_path = (
+            output_dir
+            if isinstance(output_dir, Path)
+            else (Path("sardine.agents") / doc.get("reference", "agent") / version).resolve()
+        )
 
         descriptor_data: dict[str, Any] = {}
         descriptor_path = target_path / "agent.json"

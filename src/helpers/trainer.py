@@ -5,6 +5,7 @@ import logging
 import os
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
@@ -13,6 +14,7 @@ from xml.parsers.expat import model
 import evaluate
 import numpy as np
 import torch
+from gliner import GLiNER
 from datasets import Dataset
 from seqeval.metrics import classification_report, f1_score, precision_score, recall_score
 from seqeval.scheme import IOB2
@@ -48,6 +50,163 @@ LOGGER = logging.getLogger(__name__)
 MODEL_NAME = "camembert/camembert-large"
 MAX_SEQ_LENGTH = 512
 O_LABEL = "O"
+
+
+def _strip_bio_prefix(label: str) -> str:
+    if label.upper().startswith(("B-", "I-")):
+        _, base = label.split("-", 1)
+        return base
+    return label
+
+
+def _bio_tags_to_entities(tokens: Sequence[str], ner_tags: Sequence[str]) -> List[List[Any]]:
+    entities: List[List[Any]] = []
+    start_idx = -1
+    current_label: Optional[str] = None
+
+    for idx, tag in enumerate(ner_tags):
+        base_label = _strip_bio_prefix(str(tag or "").strip())
+
+        if not base_label or base_label == O_LABEL:
+            if current_label is not None:
+                entities.append([start_idx, idx - 1, current_label])
+                current_label = None
+                start_idx = -1
+            continue
+
+        if current_label is None:
+            start_idx = idx
+            current_label = base_label
+            continue
+
+        if base_label != current_label:
+            entities.append([start_idx, idx - 1, current_label])
+            start_idx = idx
+            current_label = base_label
+
+    if current_label is not None:
+        entities.append([start_idx, len(ner_tags) - 1, current_label])
+
+    return entities
+
+
+def _extract_entity_labels(model: Mapping[str, Any], dataset: Sequence[Mapping[str, Any]]) -> List[str]:
+    raw_label_names = list(model.get("labels") or [])
+
+    mapper_spec = model.get("mapper")
+    if not raw_label_names and mapper_spec:
+        schema = DocumentSchema.from_mapping(mapper_spec)
+        for label in schema.entity_labels():
+            raw_label_names.append(label)
+
+    if not raw_label_names:
+        found_labels = set()
+        for example in dataset:
+            data = example.get("data") or {}
+            for tag in data.get("ner_tags") or []:
+                base = _strip_bio_prefix(str(tag))
+                if base and base != O_LABEL:
+                    found_labels.add(base)
+            for start, end, label in data.get("entities") or []:
+                base = _strip_bio_prefix(str(label))
+                if base and base != O_LABEL:
+                    found_labels.add(base)
+        raw_label_names = sorted(found_labels)
+
+    return [name for name in raw_label_names if name]
+
+
+def _prepare_gliner_dataset(examples: Sequence[Mapping[str, Any]], labels: Sequence[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    allowed = {label for label in labels if label}
+    gliner_data: List[Dict[str, Any]] = []
+
+    for example in examples:
+        data = example.get("data") or {}
+        tokens = data.get("tokens") or []
+        ner_tags = data.get("ner_tags") or []
+
+        if not tokens:
+            text = str(data.get("text", "")).strip()
+            if not text:
+                continue
+            tokens = text.split()
+            ner_tags = [O_LABEL] * len(tokens)
+
+        entities = _bio_tags_to_entities(tokens, ner_tags)
+        entities = [entity for entity in entities if entity[2] in allowed]
+
+        gliner_data.append({"tokenized_text": tokens, "ner": entities})
+
+    if not gliner_data:
+        raise ValueError("Dataset GLiNER vide après conversion")
+
+    split_idx = max(1, int(len(gliner_data) * 0.9))
+    train_set = gliner_data[:split_idx]
+    eval_set = gliner_data[split_idx:] or gliner_data[:1]
+
+    return train_set, eval_set
+
+
+def train_with_gliner(
+    dataset: Sequence[Mapping[str, Any]],
+    model: Mapping[str, Any],
+    *,
+    parameters: Optional[Mapping[str, Any]] = None,
+    version: str = "1.0",
+    output_dir: Optional[Path] = None,
+    db=None,
+    dataset_id: Optional[Any] = None,
+):
+    parameters = parameters or {}
+
+    entity_labels = _extract_entity_labels(model, dataset)
+    if not entity_labels:
+        raise ValueError("Aucune entité détectée pour l'entraînement GLiNER")
+
+    train_set, eval_set = _prepare_gliner_dataset(dataset, entity_labels)
+
+    batch_size = parameters.get("batch_size", 4)
+    num_epochs = parameters.get("num_train_epochs", parameters.get("epochs", 5))
+    learning_rate = parameters.get("learning_rate", 1e-5)
+    base_model = parameters.get("base_model", "urchade/gliner_multi-v2.1")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    gliner_model = GLiNER.from_pretrained(base_model)
+    gliner_model.to(device)
+
+    save_directory = output_dir or Path("sardine.agents") / model.get("reference", "agent") / str(version)
+    save_directory.mkdir(parents=True, exist_ok=True)
+
+    gliner_model.train_model(
+        train_data=train_set,
+        eval_data=eval_set,
+        batch_size=batch_size,
+        num_epochs=num_epochs,
+        learning_rate=learning_rate,
+        save_directory=str(save_directory),
+        device=device,
+    )
+
+    if db is not None and dataset_id is not None:
+        db.get_collection("datasets_snapshots").insert_one(
+            {
+                "dataset": dataset_id,
+                "created_at": datetime.utcnow(),
+                "train_size": len(train_set),
+                "eval_size": len(eval_set),
+                "train": train_set,
+                "eval": eval_set,
+                "parameters": {
+                    "batch_size": batch_size,
+                    "num_epochs": num_epochs,
+                    "learning_rate": learning_rate,
+                    "base_model": base_model,
+                },
+                "type": "gliner",
+            }
+        )
+
+    return gliner_model, save_directory
 
 
 @dataclass
