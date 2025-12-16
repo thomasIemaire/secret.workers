@@ -10,6 +10,8 @@ import rstr
 from bson import ObjectId
 from transformers import AutoTokenizer
 
+from src.helpers.document import DocumentSchema
+
 LOGGER = logging.getLogger(__name__)
 PLACEHOLDER_PATTERN = re.compile(r"\{(?P<key>[^:{}]+)(?::[^{}]*)?\}")
 BULK_INSERT_SIZE = 500
@@ -73,8 +75,19 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
             negative_configurations = list(configs.find({"_id": {"$in": negative_ids}}))
             LOGGER.info(f"Chargement de {len(negative_configurations)} configurations de bruit (négatives).")
 
-    entity_keys = list((model.get("entities") or {}).keys())
-    
+    entity_keys: List[str] = []
+
+    mapper_spec = model.get("mapper")
+    if mapper_spec:
+        try:
+            schema = DocumentSchema.from_mapping(mapper_spec)
+            entity_keys = [label for label in schema.entity_labels() if label]
+        except Exception as exc:
+            LOGGER.warning("Impossible de lire le mapper pour déterminer les entités: %s", exc)
+
+    if not entity_keys:
+        entity_keys = list((model.get("entities") or {}).keys())
+
     if not entity_keys and configuration:
         LOGGER.info("Aucune entité définie dans le modèle, utilisation des attributs de la configuration.")
         attributes = configuration.get("attributes") or []
