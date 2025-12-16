@@ -170,6 +170,25 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
 def cleanup_checkpoints(path: Path) -> None:
     if not path.exists():
         return
-    for item in path.iterdir():
-        if item.name.startswith("checkpoint-") and item.is_dir():
-            shutil.rmtree(item, ignore_errors=True)
+    checkpoint_dirs = [item for item in path.iterdir() if item.name.startswith("checkpoint-") and item.is_dir()]
+    if not checkpoint_dirs:
+        return
+
+    non_checkpoint_items = [item for item in path.iterdir() if not item.name.startswith("checkpoint-")]
+
+    # Si le dossier du modèle ne contient que des checkpoints, on conserve le plus récent
+    # en le déplaçant à la racine du dossier pour éviter de supprimer le modèle entraîné.
+    if not non_checkpoint_items:
+        latest_checkpoint = max(checkpoint_dirs, key=lambda entry: entry.stat().st_mtime)
+        for content in latest_checkpoint.iterdir():
+            target = path / content.name
+            if target.exists():
+                if target.is_dir():
+                    shutil.rmtree(target, ignore_errors=True)
+                else:
+                    target.unlink(missing_ok=True)
+            content.rename(target)
+        checkpoint_dirs = [item for item in checkpoint_dirs if item != latest_checkpoint]
+
+    for item in checkpoint_dirs:
+        shutil.rmtree(item, ignore_errors=True)
