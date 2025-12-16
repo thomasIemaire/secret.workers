@@ -3,7 +3,7 @@ pyjwt==2.9.0
 python-dotenv==1.0.1
 pymongo==4.3.3
 
-transformers==4.34.1
+transformers>=4.38.2
 datasets==2.14.6
 seqeval==1.2.2
 torch==2.0.1
