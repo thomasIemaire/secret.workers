@@ -204,8 +204,8 @@ def train_with_gliner(
     save_directory.mkdir(parents=True, exist_ok=True)
 
     gliner_model.train_model(
-        train_data=train_set,
-        eval_data=eval_set,
+        train_dataset=train_set,
+        eval_dataset=eval_set,
         batch_size=batch_size,
         num_epochs=num_epochs,
         learning_rate=learning_rate,
