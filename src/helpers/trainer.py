@@ -209,7 +209,7 @@ def train_with_gliner(
         batch_size=batch_size,
         num_epochs=num_epochs,
         learning_rate=learning_rate,
-        save_directory=str(save_directory),
+        output_dir=str(save_directory),
         device=device,
     )
 
