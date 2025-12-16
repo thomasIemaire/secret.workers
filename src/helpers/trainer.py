@@ -114,13 +114,27 @@ def _extract_entity_labels(model: Mapping[str, Any], dataset: Sequence[Mapping[s
                     found_labels.add(base)
         raw_label_names = sorted(found_labels)
 
-    return [name for name in raw_label_names if name]
+    normalized = []
+    seen = set()
+    for name in raw_label_names:
+        base = _strip_bio_prefix(str(name).strip())
+        if not base or base == O_LABEL:
+            continue
+        if base not in seen:
+            seen.add(base)
+            normalized.append(base)
+
+    return normalized
 
 
 def _prepare_gliner_dataset(
     examples: Sequence[Mapping[str, Any]], labels: Sequence[str], *, shuffle_seed: int = 42
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    allowed = {label for label in labels if label}
+    allowed = {
+        _strip_bio_prefix(label)
+        for label in labels
+        if label and _strip_bio_prefix(label) != O_LABEL
+    }
     gliner_data: List[Dict[str, Any]] = []
 
     for example in examples:
@@ -193,10 +207,6 @@ def _validate_and_filter_gliner(
             dropped += 1
             continue
 
-        if drop_empty_ner and len(ner) == 0:
-            dropped += 1
-            continue
-
         ok_ner = []
         for item in ner:
             try:
@@ -247,9 +257,9 @@ def train_with_gliner(
 
     train_set, eval_set = _prepare_gliner_dataset(dataset, entity_labels)
 
-    # Dropping empty NER examples by default prevents GLiNER collator failures on
-    # zero-column label tensors. Can be disabled via parameters if needed.
-    drop_empty = bool(parameters.get("gliner_drop_empty_ner", True))
+    # Keep empty NER examples by default to preserve explicit negatives; can be
+    # overridden via parameters for stricter filtering.
+    drop_empty = bool(parameters.get("gliner_drop_empty_ner", False))
     train_set, dropped_train = _validate_and_filter_gliner(
         train_set, drop_empty_ner=drop_empty
     )
