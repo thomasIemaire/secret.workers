@@ -252,7 +252,16 @@ class DatasetBuilder:
             built_attributes.append(built_attr)
             built_attributes.extend(extra_attrs)
 
-        resolved_text, entities = self._render_entity(template, built_attributes)
+        detection_keys = list(self.entity_keys)
+        if is_negative:
+            detection_keys = list({
+                *(detection_keys),
+                *(attr.get("key") for attr in attributes_defs if attr.get("key")),
+            })
+
+        resolved_text, entities = self._render_entity(
+            template, built_attributes, entity_keys=detection_keys
+        )
 
         resolved_text = self._apply_randomizer(resolved_text)
 
@@ -532,7 +541,10 @@ class DatasetBuilder:
         self,
         template: str,
         attributes: Sequence[Mapping[str, Any]],
+        *,
+        entity_keys: Optional[Sequence[str]] = None,
     ) -> Tuple[str, List[List[Any]]]:
+        effective_entity_keys = set(entity_keys or self.entity_keys)
         attr_map = {attr.get("key"): attr for attr in attributes}
         resolved_values: Dict[str, Dict[str, Any]] = {}
 
@@ -618,7 +630,7 @@ class DatasetBuilder:
             start = cursor
             end = start + len(value)
 
-            if key in self.entity_keys and value and requirements_met:
+            if key in effective_entity_keys and value and requirements_met:
                 entities.append([start, end, f"B-{key}"])
 
             for nested_start, nested_end, nested_key in value_info.get("entities", []):
@@ -632,7 +644,7 @@ class DatasetBuilder:
                     True if nested_attr is None else nested_attr.get("requirements_met", True)
                 )
                 
-                if nested_key in self.entity_keys and nested_requirements_met:
+                if nested_key in effective_entity_keys and nested_requirements_met:
                     entities.append([absolute_start, absolute_end, f"B-{nested_key}"])
 
             cursor = end
