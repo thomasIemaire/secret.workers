@@ -252,12 +252,10 @@ class DatasetBuilder:
             built_attributes.append(built_attr)
             built_attributes.extend(extra_attrs)
 
-        detection_keys = list(self.entity_keys)
-        if is_negative:
-            detection_keys = list({
-                *(detection_keys),
-                *(attr.get("key") for attr in attributes_defs if attr.get("key")),
-            })
+        detection_keys = list({
+            *(self.entity_keys),
+            *(attr.get("key") for attr in attributes_defs if attr.get("key")),
+        })
 
         resolved_text, entities = self._render_entity(
             template, built_attributes, entity_keys=detection_keys
@@ -266,9 +264,6 @@ class DatasetBuilder:
         resolved_text = self._apply_randomizer(resolved_text)
 
         original_entities = [list(entity) for entity in entities]
-
-        if is_negative:
-            entities = []
 
         result = {"text": resolved_text.strip(), "entities": entities}
 
