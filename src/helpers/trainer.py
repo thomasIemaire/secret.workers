@@ -620,7 +620,7 @@ def trainer(
         # Pour que load_best_model_at_end fonctionne, save et eval doivent être identiques.
         # Avec un dataset de 1000 entrées, "epoch" est plus propre que "steps".
         save_strategy="epoch",
-        eval_strategy="epoch", 
+        evaluation_strategy="epoch", 
         # ---------------------------
 
         logging_dir=str(logging_dir),
