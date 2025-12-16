@@ -253,15 +253,19 @@ class DatasetBuilder:
             built_attributes.extend(extra_attrs)
 
         resolved_text, entities = self._render_entity(template, built_attributes)
-        
+
         resolved_text = self._apply_randomizer(resolved_text)
-        
+
+        original_entities = [list(entity) for entity in entities]
+
         if is_negative:
             entities = []
-        
+
         result = {"text": resolved_text.strip(), "entities": entities}
 
-        tokenized_data = self._tokenize_and_align(result["text"], result["entities"])
+        tokenized_data = self._tokenize_and_align(
+            result["text"], result["entities"], raw_entities=original_entities
+        )
         if tokenized_data:
             result.update(tokenized_data)
 
@@ -640,7 +644,9 @@ class DatasetBuilder:
         
         return final_text, entities
 
-    def _tokenize_and_align(self, text: str, entities: List[List[Any]]) -> Dict[str, Any]:
+    def _tokenize_and_align(
+        self, text: str, entities: List[List[Any]], *, raw_entities: Optional[List[List[Any]]] = None
+    ) -> Dict[str, Any]:
         if self.tokenizer:
             encoding = self.tokenizer(text, return_offsets_mapping=True, add_special_tokens=True)
             tokens = encoding.tokens()
@@ -672,7 +678,28 @@ class DatasetBuilder:
                     else:
                         ner_tags[idx] = f"I-{entity_type}"
 
-        return {"tokens": tokens, "ner_tags": ner_tags}
+        entity_token_ids: Dict[str, List[int]] = {}
+        for start_char, end_char, label in raw_entities or entities:
+            entity_type = label.replace("B-", "").replace("I-", "")
+            token_indices: List[int] = []
+            for idx, (token_start, token_end) in enumerate(offsets):
+                if token_start == 0 and token_end == 0:
+                    continue
+                if token_start >= start_char and token_end <= end_char:
+                    token_indices.append(idx)
+            if token_indices:
+                existing = entity_token_ids.setdefault(entity_type, [])
+                existing.extend(token_indices)
+
+        if entity_token_ids:
+            for key in entity_token_ids:
+                entity_token_ids[key] = sorted(set(entity_token_ids[key]))
+
+        result: Dict[str, Any] = {"tokens": tokens, "ner_tags": ner_tags}
+        if entity_token_ids:
+            result["entity_token_ids"] = entity_token_ids
+
+        return result
 
     def _apply_randomizer(self, text: str) -> str:
         if not self.randomizers:
