@@ -622,15 +622,24 @@ class DatasetBuilder:
             attr = attr_map.get(key)
             requirements_met = True if attr is None else attr.get("requirements_met", True)
 
-            start = cursor
-            end = start + len(value)
+            raw_start = cursor
+            raw_end = raw_start + len(value)
 
-            if key in effective_entity_keys and value and requirements_met:
+            start, end = _trim_span(value, raw_start, raw_end)
+
+            has_nested_entities = bool(value_info.get("entities"))
+
+            if (
+                key in effective_entity_keys
+                and value
+                and requirements_met
+                and not has_nested_entities
+            ):
                 entities.append([start, end, f"B-{key}"])
 
             for nested_start, nested_end, nested_key in value_info.get("entities", []):
-                absolute_start = start + nested_start
-                absolute_end = start + nested_end
+                absolute_start = raw_start + nested_start
+                absolute_end = raw_start + nested_end
                 if absolute_end <= absolute_start:
                     continue
                 
@@ -640,7 +649,11 @@ class DatasetBuilder:
                 )
                 
                 if nested_key in effective_entity_keys and nested_requirements_met:
-                    entities.append([absolute_start, absolute_end, f"B-{nested_key}"])
+                    trimmed_start, trimmed_end = _trim_span(
+                        value[nested_start:nested_end], absolute_start, absolute_end
+                    )
+                    if trimmed_end > trimmed_start:
+                        entities.append([trimmed_start, trimmed_end, f"B-{nested_key}"])
 
             cursor = end
             parts.append(value)
@@ -734,6 +747,36 @@ def coerce_type(value_type: str, value: Any) -> Any:
     if value_type == "string":
         return str(value)
     return value
+
+
+def _trim_span(raw_value: str, start: int, end: int) -> Tuple[int, int]:
+    """Retire les espaces en bordure pour éviter de taguer les préfixes."""
+
+    if not raw_value:
+        return start, end
+
+    leading = 0
+    trailing = 0
+
+    for char in raw_value:
+        if char.isspace():
+            leading += 1
+        else:
+            break
+
+    for char in reversed(raw_value):
+        if char.isspace():
+            trailing += 1
+        else:
+            break
+
+    new_start = start + leading
+    new_end = end - trailing
+
+    if new_end < new_start:
+        return start, end
+
+    return new_start, new_end
 
 
 def split_constraint(constraint: Any) -> List[str]:
