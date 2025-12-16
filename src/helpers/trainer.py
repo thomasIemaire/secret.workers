@@ -168,10 +168,36 @@ def train_with_gliner(
     batch_size = parameters.get("batch_size", 4)
     num_epochs = parameters.get("num_train_epochs", parameters.get("epochs", 5))
     learning_rate = parameters.get("learning_rate", 1e-5)
-    base_model = parameters.get("base_model", "urchade/gliner_multi-v2.1")
+
+    requested_base_model = (
+        parameters.get("base_model")
+        or model.get("base_model")
+        or "urchade/gliner_multi-v2.1"
+    )
+
+    # GLiNER requires a compatible checkpoint; fall back to the official release when
+    # callers provide an arbitrary CamemBERT/transformer name from the previous pipeline.
+    if "gliner" not in str(requested_base_model).lower():
+        LOGGER.warning(
+            "Base model '%s' non compatible GLiNER détecté, utilisation de 'urchade/gliner_multi-v2.1'",
+            requested_base_model,
+        )
+        base_model = "urchade/gliner_multi-v2.1"
+    else:
+        base_model = requested_base_model
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    gliner_model = GLiNER.from_pretrained(base_model)
+    try:
+        gliner_model = GLiNER.from_pretrained(base_model)
+    except FileNotFoundError:
+        if base_model == "urchade/gliner_multi-v2.1":
+            raise
+        LOGGER.warning(
+            "Impossible de charger le modèle '%s', bascule vers le modèle GLiNER par défaut",
+            base_model,
+        )
+        gliner_model = GLiNER.from_pretrained("urchade/gliner_multi-v2.1")
+
     gliner_model.to(device)
 
     save_directory = output_dir or Path("sardine.agents") / model.get("reference", "agent") / str(version)
