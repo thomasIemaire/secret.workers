@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -217,7 +218,7 @@ def train_with_gliner(
     else:
         base_model = requested_base_model
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = parameters.get("device") or ("cuda" if torch.cuda.is_available() else "cpu")
     try:
         gliner_model = GLiNER.from_pretrained(base_model)
     except FileNotFoundError:
@@ -234,14 +235,58 @@ def train_with_gliner(
     save_directory = output_dir or Path("sardine.agents") / model.get("reference", "agent") / str(version)
     save_directory.mkdir(parents=True, exist_ok=True)
 
+    signature = inspect.signature(gliner_model.train_model)
+    accepted_params = set(signature.parameters.keys())
+
+    aliases = {
+        "epochs": "num_epochs",
+        "num_train_epochs": "num_epochs",
+        "lr": "learning_rate",
+        "learning_rate": "learning_rate",
+        "max_seq_length": "max_length",
+    }
+
+    def _maybe_add(name: str, value: Any, target: Optional[str] = None) -> None:
+        param_name = target or aliases.get(name, name)
+        if param_name in accepted_params and value is not None:
+            train_kwargs[param_name] = value
+
+    train_kwargs: Dict[str, Any] = {}
+
+    _maybe_add("batch_size", batch_size)
+    _maybe_add("num_epochs", num_epochs)
+    _maybe_add("learning_rate", learning_rate)
+    _maybe_add("device", device)
+
+    optional_keys = [
+        "gradient_accumulation_steps",
+        "warmup_steps",
+        "warmup_ratio",
+        "weight_decay",
+        "max_steps",
+        "eval_steps",
+        "save_steps",
+        "logging_steps",
+        "save_total_limit",
+        "max_length",
+        "max_seq_length",
+    ]
+
+    for key in optional_keys:
+        _maybe_add(key, parameters.get(key))
+
+    for raw_key, raw_value in parameters.items():
+        if raw_value is None:
+            continue
+        target_key = aliases.get(raw_key, raw_key)
+        if target_key in accepted_params and target_key not in train_kwargs:
+            train_kwargs[target_key] = raw_value
+
     gliner_model.train_model(
         train_dataset=train_set,
         eval_dataset=eval_set,
-        # batch_size=batch_size,
-        # num_epochs=num_epochs,
-        learning_rate=learning_rate,
         output_dir=str(save_directory),
-        # device=device,
+        **train_kwargs,
     )
 
     if db is not None and dataset_id is not None:
