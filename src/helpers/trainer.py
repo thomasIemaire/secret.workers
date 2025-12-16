@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
+import random
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
-from xml.parsers.expat import model
 
 import evaluate
 import numpy as np
@@ -116,12 +117,36 @@ def _extract_entity_labels(model: Mapping[str, Any], dataset: Sequence[Mapping[s
     return [name for name in raw_label_names if name]
 
 
-def _prepare_gliner_dataset(examples: Sequence[Mapping[str, Any]], labels: Sequence[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _prepare_gliner_dataset(
+    examples: Sequence[Mapping[str, Any]], labels: Sequence[str], *, shuffle_seed: int = 42
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     allowed = {label for label in labels if label}
     gliner_data: List[Dict[str, Any]] = []
 
     for example in examples:
         data = example.get("data") or {}
+
+        prebuilt = data.get("gliner") or {}
+        pre_tokens = prebuilt.get("tokenized_text")
+        pre_entities = prebuilt.get("ner")
+
+        if pre_tokens:
+            filtered: List[List[Any]] = []
+            for raw in pre_entities or []:
+                try:
+                    start, end, label = raw
+                except (TypeError, ValueError):
+                    continue
+
+                base_label = str(label or "").split("-", 1)[-1]
+                if base_label in allowed:
+                    filtered.append([int(start), int(end), base_label])
+
+            gliner_data.append(
+                {"tokenized_text": list(pre_tokens), "ner": filtered}
+            )
+            continue
+
         tokens = data.get("tokens") or []
         ner_tags = data.get("ner_tags") or []
 
@@ -132,6 +157,10 @@ def _prepare_gliner_dataset(examples: Sequence[Mapping[str, Any]], labels: Seque
             tokens = text.split()
             ner_tags = [O_LABEL] * len(tokens)
 
+        if len(ner_tags) < len(tokens):
+            ner_tags = list(ner_tags) + [O_LABEL] * (len(tokens) - len(ner_tags))
+        ner_tags = list(ner_tags)[: len(tokens)]
+
         entities = _bio_tags_to_entities(tokens, ner_tags)
         entities = [entity for entity in entities if entity[2] in allowed]
 
@@ -139,6 +168,9 @@ def _prepare_gliner_dataset(examples: Sequence[Mapping[str, Any]], labels: Seque
 
     if not gliner_data:
         raise ValueError("Dataset GLiNER vide après conversion")
+
+    rng = random.Random(shuffle_seed)
+    rng.shuffle(gliner_data)
 
     split_idx = max(1, int(len(gliner_data) * 0.9))
     train_set = gliner_data[:split_idx]
@@ -186,7 +218,7 @@ def train_with_gliner(
     else:
         base_model = requested_base_model
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = parameters.get("device") or ("cuda" if torch.cuda.is_available() else "cpu")
     try:
         gliner_model = GLiNER.from_pretrained(base_model)
     except FileNotFoundError:
@@ -203,14 +235,58 @@ def train_with_gliner(
     save_directory = output_dir or Path("sardine.agents") / model.get("reference", "agent") / str(version)
     save_directory.mkdir(parents=True, exist_ok=True)
 
+    signature = inspect.signature(gliner_model.train_model)
+    accepted_params = set(signature.parameters.keys())
+
+    aliases = {
+        "epochs": "num_epochs",
+        "num_train_epochs": "num_epochs",
+        "lr": "learning_rate",
+        "learning_rate": "learning_rate",
+        "max_seq_length": "max_length",
+    }
+
+    def _maybe_add(name: str, value: Any, target: Optional[str] = None) -> None:
+        param_name = target or aliases.get(name, name)
+        if param_name in accepted_params and value is not None:
+            train_kwargs[param_name] = value
+
+    train_kwargs: Dict[str, Any] = {}
+
+    _maybe_add("batch_size", batch_size)
+    _maybe_add("num_epochs", num_epochs)
+    _maybe_add("learning_rate", learning_rate)
+    _maybe_add("device", device)
+
+    optional_keys = [
+        "gradient_accumulation_steps",
+        "warmup_steps",
+        "warmup_ratio",
+        "weight_decay",
+        "max_steps",
+        "eval_steps",
+        "save_steps",
+        "logging_steps",
+        "save_total_limit",
+        "max_length",
+        "max_seq_length",
+    ]
+
+    for key in optional_keys:
+        _maybe_add(key, parameters.get(key))
+
+    for raw_key, raw_value in parameters.items():
+        if raw_value is None:
+            continue
+        target_key = aliases.get(raw_key, raw_key)
+        if target_key in accepted_params and target_key not in train_kwargs:
+            train_kwargs[target_key] = raw_value
+
     gliner_model.train_model(
         train_dataset=train_set,
         eval_dataset=eval_set,
-        # batch_size=batch_size,
-        # num_epochs=num_epochs,
-        learning_rate=learning_rate,
         output_dir=str(save_directory),
-        # device=device,
+        **train_kwargs,
     )
 
     if db is not None and dataset_id is not None:
