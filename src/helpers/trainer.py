@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
-from xml.parsers.expat import model
 
 import evaluate
 import numpy as np
@@ -116,12 +116,36 @@ def _extract_entity_labels(model: Mapping[str, Any], dataset: Sequence[Mapping[s
     return [name for name in raw_label_names if name]
 
 
-def _prepare_gliner_dataset(examples: Sequence[Mapping[str, Any]], labels: Sequence[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _prepare_gliner_dataset(
+    examples: Sequence[Mapping[str, Any]], labels: Sequence[str], *, shuffle_seed: int = 42
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     allowed = {label for label in labels if label}
     gliner_data: List[Dict[str, Any]] = []
 
     for example in examples:
         data = example.get("data") or {}
+
+        prebuilt = data.get("gliner") or {}
+        pre_tokens = prebuilt.get("tokenized_text")
+        pre_entities = prebuilt.get("ner")
+
+        if pre_tokens:
+            filtered: List[List[Any]] = []
+            for raw in pre_entities or []:
+                try:
+                    start, end, label = raw
+                except (TypeError, ValueError):
+                    continue
+
+                base_label = str(label or "").split("-", 1)[-1]
+                if base_label in allowed:
+                    filtered.append([int(start), int(end), base_label])
+
+            gliner_data.append(
+                {"tokenized_text": list(pre_tokens), "ner": filtered}
+            )
+            continue
+
         tokens = data.get("tokens") or []
         ner_tags = data.get("ner_tags") or []
 
@@ -132,6 +156,10 @@ def _prepare_gliner_dataset(examples: Sequence[Mapping[str, Any]], labels: Seque
             tokens = text.split()
             ner_tags = [O_LABEL] * len(tokens)
 
+        if len(ner_tags) < len(tokens):
+            ner_tags = list(ner_tags) + [O_LABEL] * (len(tokens) - len(ner_tags))
+        ner_tags = list(ner_tags)[: len(tokens)]
+
         entities = _bio_tags_to_entities(tokens, ner_tags)
         entities = [entity for entity in entities if entity[2] in allowed]
 
@@ -139,6 +167,9 @@ def _prepare_gliner_dataset(examples: Sequence[Mapping[str, Any]], labels: Seque
 
     if not gliner_data:
         raise ValueError("Dataset GLiNER vide après conversion")
+
+    rng = random.Random(shuffle_seed)
+    rng.shuffle(gliner_data)
 
     split_idx = max(1, int(len(gliner_data) * 0.9))
     train_set = gliner_data[:split_idx]

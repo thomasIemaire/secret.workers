@@ -251,8 +251,60 @@ class DatasetBuilder:
         tokenized_data = self._tokenize_and_align(result["text"], result["entities"])
         if tokenized_data:
             result.update(tokenized_data)
-            
+
+        gliner_ready = self._build_gliner_entry(
+            result.get("tokens") or [], result.get("ner_tags") or []
+        )
+        if gliner_ready:
+            result["gliner"] = gliner_ready
+
         return result
+
+    def _build_gliner_entry(
+        self, tokens: Sequence[str], ner_tags: Sequence[str]
+    ) -> Optional[Dict[str, Any]]:
+        if not tokens:
+            return None
+
+        tags = list(ner_tags) if ner_tags else ["O"] * len(tokens)
+        if len(tags) < len(tokens):
+            tags.extend(["O"] * (len(tokens) - len(tags)))
+        tags = tags[: len(tokens)]
+
+        entities: List[List[Any]] = []
+        start_idx: Optional[int] = None
+        current_label: Optional[str] = None
+
+        for idx, tag in enumerate(tags):
+            normalized = str(tag or "").strip()
+            base = normalized.split("-", 1)[-1] if normalized else ""
+
+            if not base or base.upper() == "O":
+                if current_label is not None:
+                    entities.append([start_idx, idx - 1, current_label])
+                    current_label = None
+                    start_idx = None
+                continue
+
+            if normalized.upper().startswith(("B-", "I-")):
+                if current_label is None:
+                    start_idx = idx
+                    current_label = base
+                    continue
+                if base != current_label:
+                    entities.append([start_idx, idx - 1, current_label])
+                    start_idx = idx
+                    current_label = base
+            else:
+                # Valeur non BIO mais non vide : on démarre/continue l'entité courante
+                if current_label is None:
+                    start_idx = idx
+                    current_label = base
+
+        if current_label is not None and start_idx is not None:
+            entities.append([start_idx, len(tags) - 1, current_label])
+
+        return {"tokenized_text": list(tokens), "ner": entities}
 
     def _build_attribute(self, attribute: Mapping[str, Any], context: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         key = attribute.get("key")
