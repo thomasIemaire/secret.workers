@@ -6,3 +6,9 @@ sardine.agents/*
 *$py.class
 *.pyc
 .env
+
+venv1/
+.venv1/
+qa/
+.qa/
+logs/
