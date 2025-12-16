@@ -247,7 +247,9 @@ def train_with_gliner(
 
     train_set, eval_set = _prepare_gliner_dataset(dataset, entity_labels)
 
-    drop_empty = bool(parameters.get("gliner_drop_empty_ner", False))
+    # Dropping empty NER examples by default prevents GLiNER collator failures on
+    # zero-column label tensors. Can be disabled via parameters if needed.
+    drop_empty = bool(parameters.get("gliner_drop_empty_ner", True))
     train_set, dropped_train = _validate_and_filter_gliner(
         train_set, drop_empty_ner=drop_empty
     )
