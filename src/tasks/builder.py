@@ -15,6 +15,7 @@ from src.helpers.document import DocumentSchema
 LOGGER = logging.getLogger(__name__)
 PLACEHOLDER_PATTERN = re.compile(r"\{(?P<key>[^:{}]+)(?::[^{}]*)?\}")
 BULK_INSERT_SIZE = 500
+TOKEN_PATTERN = re.compile(r"[0-9A-Za-zÀ-ÖØ-öø-ÿ_/-]+|[^\s]", re.UNICODE)
 
 
 def normalize_requirements(requirement_spec: Any) -> List[Mapping[str, Any]]:
@@ -267,65 +268,101 @@ class DatasetBuilder:
 
         result = {"text": resolved_text.strip(), "entities": entities}
 
-        tokenized_data = self._tokenize_and_align(
-            result["text"], result["entities"], raw_entities=original_entities
-        )
-        if tokenized_data:
-            result.update(tokenized_data)
+        drop = {"prefixe"}
 
-        gliner_ready = self._build_gliner_entry(
-            result.get("tokens") or [], result.get("ner_tags") or []
+        gliner_ready = self._build_gliner_entry_from_text(
+            result["text"], result["entities"], drop_labels=drop
         )
         if gliner_ready:
             result["gliner"] = gliner_ready
 
         return result
 
-    def _build_gliner_entry(
-        self, tokens: Sequence[str], ner_tags: Sequence[str]
+    def _tokenize_for_gliner(self, text: str) -> Tuple[List[str], List[Tuple[int, int]]]:
+        tokens: List[str] = []
+        offsets: List[Tuple[int, int]] = []
+        for m in TOKEN_PATTERN.finditer(text):
+            tok = m.group(0)
+            tokens.append(tok)
+            offsets.append((m.start(), m.end()))
+        return tokens, offsets
+
+    def _bio_tags_from_char_spans(
+        self,
+        offsets: List[Tuple[int, int]],
+        entities: List[List[Any]],
+        *,
+        drop_labels: Optional[Set[str]] = None,
+    ) -> List[str]:
+        drop_labels = drop_labels or set()
+        tags = ["O"] * len(offsets)
+
+        for start_char, end_char, raw_label in sorted(entities, key=lambda x: x[0]):
+            label = str(raw_label)
+            label = label.replace("B-", "").replace("I-", "").strip()
+            if not label or label in drop_labels:
+                continue
+
+            begun = False
+            for i, (ts, te) in enumerate(offsets):
+                if te <= start_char or ts >= end_char:
+                    continue
+                if not begun:
+                    tags[i] = f"B-{label}"
+                    begun = True
+                else:
+                    tags[i] = f"I-{label}"
+        return tags
+
+    def _build_gliner_entry_from_text(
+        self,
+        text: str,
+        entities: List[List[Any]],
+        *,
+        drop_labels: Optional[Set[str]] = None,
     ) -> Optional[Dict[str, Any]]:
+        tokens, offsets = self._tokenize_for_gliner(text)
         if not tokens:
             return None
 
-        tags = list(ner_tags) if ner_tags else ["O"] * len(tokens)
-        if len(tags) < len(tokens):
-            tags.extend(["O"] * (len(tokens) - len(tags)))
-        tags = tags[: len(tokens)]
+        tags = self._bio_tags_from_char_spans(offsets, entities, drop_labels=drop_labels)
 
-        entities: List[List[Any]] = []
+        ner: List[List[Any]] = []
         start_idx: Optional[int] = None
         current_label: Optional[str] = None
 
-        for idx, tag in enumerate(tags):
-            normalized = str(tag or "").strip()
-            base = normalized.split("-", 1)[-1] if normalized else ""
+        def flush(end_idx: int):
+            nonlocal start_idx, current_label
+            if current_label is not None and start_idx is not None:
+                ner.append([start_idx, end_idx, current_label])
+            start_idx = None
+            current_label = None
 
-            if not base or base.upper() == "O":
+        for i, tag in enumerate(tags):
+            if tag == "O":
                 if current_label is not None:
-                    entities.append([start_idx, idx - 1, current_label])
-                    current_label = None
-                    start_idx = None
+                    flush(i - 1)
                 continue
 
-            if normalized.upper().startswith(("B-", "I-")):
-                if current_label is None:
-                    start_idx = idx
-                    current_label = base
-                    continue
-                if base != current_label:
-                    entities.append([start_idx, idx - 1, current_label])
-                    start_idx = idx
-                    current_label = base
+            bio, lab = tag.split("-", 1)
+            if bio == "B":
+                if current_label is not None:
+                    flush(i - 1)
+                start_idx = i
+                current_label = lab
             else:
-                # Valeur non BIO mais non vide : on démarre/continue l'entité courante
                 if current_label is None:
-                    start_idx = idx
-                    current_label = base
+                    start_idx = i
+                    current_label = lab
+                elif lab != current_label:
+                    flush(i - 1)
+                    start_idx = i
+                    current_label = lab
 
-        if current_label is not None and start_idx is not None:
-            entities.append([start_idx, len(tags) - 1, current_label])
+        if current_label is not None:
+            flush(len(tags) - 1)
 
-        return {"tokenized_text": list(tokens), "ner": entities}
+        return {"tokenized_text": tokens, "ner": ner}
 
     def _build_attribute(self, attribute: Mapping[str, Any], context: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         key = attribute.get("key")
@@ -631,6 +668,7 @@ class DatasetBuilder:
 
             if (
                 key in effective_entity_keys
+                and key != "prefixe"
                 and value
                 and requirements_met
                 and not has_nested_entities
@@ -648,7 +686,11 @@ class DatasetBuilder:
                     True if nested_attr is None else nested_attr.get("requirements_met", True)
                 )
                 
-                if nested_key in effective_entity_keys and nested_requirements_met:
+                if (
+                    nested_key in effective_entity_keys
+                    and nested_key != "prefixe"
+                    and nested_requirements_met
+                ):
                     trimmed_start, trimmed_end = _trim_span(
                         value[nested_start:nested_end], absolute_start, absolute_end
                     )
