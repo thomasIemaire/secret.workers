@@ -247,9 +247,9 @@ class DatasetBuilder:
             entities = []
         
         result = {"text": resolved_text.strip(), "entities": entities}
-        
-        if self.tokenizer:
-            tokenized_data = self._tokenize_and_align(result["text"], result["entities"])
+
+        tokenized_data = self._tokenize_and_align(result["text"], result["entities"])
+        if tokenized_data:
             result.update(tokenized_data)
             
         return result
@@ -576,13 +576,24 @@ class DatasetBuilder:
         return final_text, entities
 
     def _tokenize_and_align(self, text: str, entities: List[List[Any]]) -> Dict[str, Any]:
-        encoding = self.tokenizer(text, return_offsets_mapping=True, add_special_tokens=True)
-        tokens = encoding.tokens()
-        offsets = encoding["offset_mapping"]
-        
+        if self.tokenizer:
+            encoding = self.tokenizer(text, return_offsets_mapping=True, add_special_tokens=True)
+            tokens = encoding.tokens()
+            offsets = encoding["offset_mapping"]
+        else:
+            # Fallback simple pour garantir des tokens pour GLiNER même sans tokenizer HF
+            tokens = text.split()
+            offsets = []
+            cursor = 0
+            for token in tokens:
+                start = text.find(token, cursor)
+                end = start + len(token)
+                offsets.append((start, end))
+                cursor = end
+
         ner_tags = ["O"] * len(tokens)
         entities.sort(key=lambda x: x[0])
-        
+
         for start_char, end_char, label in entities:
             entity_type = label.replace("B-", "").replace("I-", "")
             found_start = False
@@ -595,7 +606,7 @@ class DatasetBuilder:
                         found_start = True
                     else:
                         ner_tags[idx] = f"I-{entity_type}"
-                        
+
         return {"tokens": tokens, "ner_tags": ner_tags}
 
     def _apply_randomizer(self, text: str) -> str:
