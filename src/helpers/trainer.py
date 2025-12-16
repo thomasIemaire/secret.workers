@@ -179,6 +179,56 @@ def _prepare_gliner_dataset(
     return train_set, eval_set
 
 
+def _validate_and_filter_gliner(
+    gliner_data, *, drop_empty_ner: bool = False
+):
+    cleaned = []
+    dropped = 0
+
+    for ex in gliner_data:
+        toks = ex.get("tokenized_text") or []
+        ner = ex.get("ner") or []
+
+        if not isinstance(toks, list) or len(toks) == 0:
+            dropped += 1
+            continue
+
+        if drop_empty_ner and len(ner) == 0:
+            dropped += 1
+            continue
+
+        ok_ner = []
+        for item in ner:
+            try:
+                s, e, lab = item
+                s = int(s)
+                e = int(e)
+                lab = str(lab).strip()
+            except Exception:
+                continue
+
+            if not lab:
+                continue
+            if s < 0 or e < 0:
+                continue
+            if s > e:
+                continue
+            if s >= len(toks) or e >= len(toks):
+                continue
+
+            ok_ner.append([s, e, lab])
+
+        ex["ner"] = ok_ner
+
+        if drop_empty_ner and len(ex["ner"]) == 0:
+            dropped += 1
+            continue
+
+        cleaned.append(ex)
+
+    return cleaned, dropped
+
+
 def train_with_gliner(
     dataset: Sequence[Mapping[str, Any]],
     model: Mapping[str, Any],
@@ -197,7 +247,30 @@ def train_with_gliner(
 
     train_set, eval_set = _prepare_gliner_dataset(dataset, entity_labels)
 
-    batch_size = parameters.get("batch_size", 4)
+    drop_empty = bool(parameters.get("gliner_drop_empty_ner", False))
+    train_set, dropped_train = _validate_and_filter_gliner(
+        train_set, drop_empty_ner=drop_empty
+    )
+    eval_set, dropped_eval = _validate_and_filter_gliner(
+        eval_set, drop_empty_ner=drop_empty
+    )
+
+    LOGGER.info(
+        "GLiNER: dropped_train=%s dropped_eval=%s (drop_empty=%s)",
+        dropped_train,
+        dropped_eval,
+        drop_empty,
+    )
+
+    if not train_set:
+        raise ValueError("Train set GLiNER vide après validation/filtrage.")
+    if not eval_set:
+        eval_set = train_set[:1]
+
+    batch_size = int(parameters.get("batch_size", 4))
+    batch_size = max(1, batch_size)
+    if parameters.get("gliner_safe_mode"):
+        batch_size = 1
     num_epochs = parameters.get("num_train_epochs", parameters.get("epochs", 5))
     learning_rate = parameters.get("learning_rate", 1e-5)
 
@@ -257,6 +330,13 @@ def train_with_gliner(
     _maybe_add("num_epochs", num_epochs)
     _maybe_add("learning_rate", learning_rate)
     _maybe_add("device", device)
+
+    if "labels" in accepted_params:
+        train_kwargs["labels"] = list(entity_labels)
+    elif "label_list" in accepted_params:
+        train_kwargs["label_list"] = list(entity_labels)
+    elif "entity_labels" in accepted_params:
+        train_kwargs["entity_labels"] = list(entity_labels)
 
     optional_keys = [
         "gradient_accumulation_steps",
