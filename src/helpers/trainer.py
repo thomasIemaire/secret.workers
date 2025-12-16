@@ -206,11 +206,11 @@ def train_with_gliner(
     gliner_model.train_model(
         train_dataset=train_set,
         eval_dataset=eval_set,
-        batch_size=batch_size,
-        num_epochs=num_epochs,
+        # batch_size=batch_size,
+        # num_epochs=num_epochs,
         learning_rate=learning_rate,
         output_dir=str(save_directory),
-        device=device,
+        # device=device,
     )
 
     if db is not None and dataset_id is not None:
