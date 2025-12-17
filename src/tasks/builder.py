@@ -213,7 +213,7 @@ class DatasetBuilder:
         self.train_params = dict(train_params or {})
 
         injection_mode = str(self.train_params.get("negative_injection_mode", "append"))
-        if injection_mode not in {"append", "prepend", "inject"}:
+        if injection_mode not in {"append", "prepend", "inject", "mixed"}:
             injection_mode = "append"
         self.negative_injection_mode = injection_mode
         self.negative_injection_separator = str(self.train_params.get("negative_injection_separator", "\n"))
@@ -283,15 +283,27 @@ class DatasetBuilder:
         should_inject_noise = is_negative and bool(self.negative_configurations)
         if should_inject_noise:
             if self.negative_injection_probability is None or random.random() < self.negative_injection_probability:
-                negative_config = random.choice(self.negative_configurations)
-                noise_text = self._generate_negative_noise(negative_config)
-                final_text, final_entities = self._inject_noise(
-                    final_text,
-                    final_entities,
-                    noise_text,
-                    self.negative_injection_mode,
-                    self.negative_injection_separator,
-                )
+                max_noises = max(1, len(self.negative_configurations))
+                noise_count = random.randint(1, max_noises)
+                LOGGER.debug("Preparing to inject %d negative noise block(s).", noise_count)
+
+                for _ in range(noise_count):
+                    negative_config = random.choice(self.negative_configurations)
+                    noise_text = self._generate_negative_noise(negative_config)
+                    if not noise_text:
+                        continue
+
+                    mode_choice = self.negative_injection_mode
+                    if mode_choice == "mixed":
+                        mode_choice = random.choice(["append", "prepend", "inject"])
+
+                    final_text, final_entities = self._inject_noise(
+                        final_text,
+                        final_entities,
+                        noise_text,
+                        mode_choice,
+                        self.negative_injection_separator,
+                    )
 
         final_text = self._apply_randomizer(final_text)
 
