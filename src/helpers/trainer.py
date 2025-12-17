@@ -238,6 +238,75 @@ def _validate_and_filter_gliner(
 
     return cleaned, dropped
 
+
+def _preflight_gliner_examples(
+    gliner_data: Sequence[Mapping[str, Any]],
+    entity_labels: Sequence[str],
+    *,
+    remove_empty_ner: bool = True,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int], Counter, Counter]:
+    allowed_labels = {str(label).strip() for label in entity_labels}
+    stats = Counter()
+    label_spans = Counter()
+    label_examples = Counter()
+    cleaned: List[Dict[str, Any]] = []
+
+    for ex in gliner_data:
+        tokens = list(ex.get("tokenized_text") or [])
+        ner = ex.get("ner") or []
+
+        if not tokens:
+            stats["empty_tokens"] += 1
+            continue
+
+        valid_entities = []
+        labels_in_example = set()
+        for raw in ner:
+            try:
+                start, end, label = raw
+                start = int(start)
+                end = int(end)
+            except Exception:
+                stats["invalid_triplet"] += 1
+                continue
+
+            label = str(label or "").strip()
+            if not label:
+                stats["empty_label"] += 1
+                continue
+
+            if label not in allowed_labels:
+                stats["unknown_label"] += 1
+                continue
+
+            if start < 0 or end < 0:
+                stats["negative_index"] += 1
+                continue
+
+            if start > end:
+                stats["reversed_span"] += 1
+                continue
+
+            if start >= len(tokens) or end >= len(tokens):
+                stats["span_out_of_bounds"] += 1
+                continue
+
+            valid_entities.append([start, end, label])
+            label_spans[label] += 1
+            labels_in_example.add(label)
+
+        if not valid_entities and remove_empty_ner:
+            stats["empty_ner"] += 1
+            continue
+
+        for label in labels_in_example:
+            label_examples[label] += 1
+
+        cleaned.append({"tokenized_text": tokens, "ner": valid_entities})
+
+    return cleaned, dict(stats), label_spans, label_examples
+
+
 def _extract_entity_labels_from_gliner_dataset(dataset):
     labels = set()
     for example in dataset:
@@ -287,17 +356,47 @@ def train_with_gliner(
         drop_empty,
     )
 
+    train_len_before = len(train_set)
+    eval_len_before = len(eval_set)
+
+    train_set, train_stats, train_label_spans, train_label_examples = _preflight_gliner_examples(
+        train_set,
+        entity_labels,
+    )
+    eval_set, eval_stats, eval_label_spans, eval_label_examples = _preflight_gliner_examples(
+        eval_set,
+        entity_labels,
+    )
+
+    LOGGER.info(
+        "GLiNER preflight train: kept=%s dropped=%s stats=%s top_labels=%s examples_per_label=%s",
+        len(train_set),
+        train_len_before - len(train_set),
+        train_stats,
+        train_label_spans.most_common(10),
+        train_label_examples.most_common(10),
+    )
+    LOGGER.info(
+        "GLiNER preflight eval: kept=%s dropped=%s stats=%s top_labels=%s examples_per_label=%s",
+        len(eval_set),
+        eval_len_before - len(eval_set),
+        eval_stats,
+        eval_label_spans.most_common(10),
+        eval_label_examples.most_common(10),
+    )
+
     if not train_set:
-        raise ValueError("Train set GLiNER vide après validation/filtrage.")
+        raise ValueError("Train set GLiNER vide après préflight.")
     if not eval_set:
         eval_set = train_set[:1]
 
-    batch_size = int(parameters.get("batch_size", 4))
-    batch_size = max(1, batch_size)
+    batch_size = int(parameters.get("batch_size", 8))
+    batch_size = max(1, min(batch_size, 16))
     if parameters.get("gliner_safe_mode"):
         batch_size = 1
-    num_epochs = parameters.get("num_train_epochs", parameters.get("epochs", 5))
-    learning_rate = parameters.get("learning_rate", 1e-5)
+    num_epochs = parameters.get("num_train_epochs", parameters.get("epochs", 3))
+    num_epochs = max(1, min(int(num_epochs), 10))
+    learning_rate = parameters.get("learning_rate", 2e-5)
 
     has_empty = any(len(ex.get("ner") or []) == 0 for ex in train_set)
     if has_empty:
@@ -361,6 +460,20 @@ def train_with_gliner(
     _maybe_add("learning_rate", learning_rate)
     _maybe_add("device", device)
 
+    grad_accum = parameters.get("gradient_accumulation_steps", 1)
+    try:
+        grad_accum = max(1, min(int(grad_accum), 4))
+    except (TypeError, ValueError):
+        grad_accum = 1
+    _maybe_add("gradient_accumulation_steps", grad_accum)
+
+    max_length = parameters.get("max_length", parameters.get("max_seq_length", 256))
+    try:
+        max_length = min(int(max_length), 512)
+    except (TypeError, ValueError):
+        max_length = 256
+    _maybe_add("max_length", max_length)
+
     if "labels" in accepted_params:
         train_kwargs["labels"] = list(entity_labels)
     elif "label_list" in accepted_params:
@@ -369,7 +482,6 @@ def train_with_gliner(
         train_kwargs["entity_labels"] = list(entity_labels)
 
     optional_keys = [
-        "gradient_accumulation_steps",
         "warmup_steps",
         "warmup_ratio",
         "weight_decay",
@@ -378,8 +490,6 @@ def train_with_gliner(
         "save_steps",
         "logging_steps",
         "save_total_limit",
-        "max_length",
-        "max_seq_length",
     ]
 
     for key in optional_keys:
