@@ -114,13 +114,27 @@ def _extract_entity_labels(model: Mapping[str, Any], dataset: Sequence[Mapping[s
                     found_labels.add(base)
         raw_label_names = sorted(found_labels)
 
-    return [name for name in raw_label_names if name]
+    normalized = []
+    seen = set()
+    for name in raw_label_names:
+        base = _strip_bio_prefix(str(name).strip())
+        if not base or base == O_LABEL:
+            continue
+        if base not in seen:
+            seen.add(base)
+            normalized.append(base)
+
+    return normalized
 
 
 def _prepare_gliner_dataset(
     examples: Sequence[Mapping[str, Any]], labels: Sequence[str], *, shuffle_seed: int = 42
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    allowed = {label for label in labels if label}
+    allowed = {
+        _strip_bio_prefix(label)
+        for label in labels
+        if label and _strip_bio_prefix(label) != O_LABEL
+    }
     gliner_data: List[Dict[str, Any]] = []
 
     for example in examples:
@@ -131,20 +145,21 @@ def _prepare_gliner_dataset(
         pre_entities = prebuilt.get("ner")
 
         if pre_tokens:
-            filtered: List[List[Any]] = []
+            cleaned_ner: List[List[Any]] = []
             for raw in pre_entities or []:
                 try:
                     start, end, label = raw
                 except (TypeError, ValueError):
                     continue
 
-                base_label = str(label or "").split("-", 1)[-1]
-                if base_label in allowed:
-                    filtered.append([int(start), int(end), base_label])
+                base_label = str(label or "").split("-", 1)[-1].strip()
+                if not base_label:
+                    continue
 
-            gliner_data.append(
-                {"tokenized_text": list(pre_tokens), "ner": filtered}
-            )
+                # on garde tout, sans filtrer par allowed
+                cleaned_ner.append([int(start), int(end), base_label])
+
+            gliner_data.append({"tokenized_text": list(pre_tokens), "ner": cleaned_ner})
             continue
 
         tokens = data.get("tokens") or []
@@ -162,7 +177,6 @@ def _prepare_gliner_dataset(
         ner_tags = list(ner_tags)[: len(tokens)]
 
         entities = _bio_tags_to_entities(tokens, ner_tags)
-        entities = [entity for entity in entities if entity[2] in allowed]
 
         gliner_data.append({"tokenized_text": tokens, "ner": entities})
 
@@ -190,10 +204,6 @@ def _validate_and_filter_gliner(
         ner = ex.get("ner") or []
 
         if not isinstance(toks, list) or len(toks) == 0:
-            dropped += 1
-            continue
-
-        if drop_empty_ner and len(ner) == 0:
             dropped += 1
             continue
 
@@ -228,6 +238,19 @@ def _validate_and_filter_gliner(
 
     return cleaned, dropped
 
+def _extract_entity_labels_from_gliner_dataset(dataset):
+    labels = set()
+    for example in dataset:
+        data = example.get("data") or {}
+        gl = data.get("gliner") or {}
+        for item in gl.get("ner") or []:
+            if not item or len(item) < 3:
+                continue
+            lab = str(item[2] or "").strip()
+            lab = lab.split("-", 1)[-1]
+            if lab:
+                labels.add(lab)
+    return sorted(labels)
 
 def train_with_gliner(
     dataset: Sequence[Mapping[str, Any]],
@@ -241,15 +264,15 @@ def train_with_gliner(
 ):
     parameters = parameters or {}
 
-    entity_labels = _extract_entity_labels(model, dataset)
+    entity_labels = _extract_entity_labels_from_gliner_dataset(dataset)
     if not entity_labels:
         raise ValueError("Aucune entité détectée pour l'entraînement GLiNER")
 
     train_set, eval_set = _prepare_gliner_dataset(dataset, entity_labels)
 
-    # Dropping empty NER examples by default prevents GLiNER collator failures on
-    # zero-column label tensors. Can be disabled via parameters if needed.
-    drop_empty = bool(parameters.get("gliner_drop_empty_ner", True))
+    # Keep empty NER examples by default to preserve explicit negatives; can be
+    # overridden via parameters for stricter filtering.
+    drop_empty = bool(parameters.get("gliner_drop_empty_ner", False))
     train_set, dropped_train = _validate_and_filter_gliner(
         train_set, drop_empty_ner=drop_empty
     )
@@ -275,6 +298,11 @@ def train_with_gliner(
         batch_size = 1
     num_epochs = parameters.get("num_train_epochs", parameters.get("epochs", 5))
     learning_rate = parameters.get("learning_rate", 1e-5)
+
+    has_empty = any(len(ex.get("ner") or []) == 0 for ex in train_set)
+    if has_empty:
+        LOGGER.warning("GLiNER: ner vide détecté -> activation batch_size=1")
+        batch_size = 1
 
     requested_base_model = (
         parameters.get("base_model")
