@@ -212,8 +212,8 @@ class DatasetBuilder:
         self.negative_configurations = negative_configurations or []
         self.train_params = dict(train_params or {})
 
-        injection_mode = str(self.train_params.get("negative_injection_mode", "append"))
-        if injection_mode not in {"append", "prepend", "inject", "mixed"}:
+        injection_mode = str(self.train_params.get("negative_injection_mode", "mixed"))
+        if injection_mode not in {"append", "prepend", "mixed"}:
             injection_mode = "append"
         self.negative_injection_mode = injection_mode
         self.negative_injection_separator = str(self.train_params.get("negative_injection_separator", "\n"))
@@ -295,7 +295,15 @@ class DatasetBuilder:
 
                     mode_choice = self.negative_injection_mode
                     if mode_choice == "mixed":
-                        mode_choice = random.choice(["append", "prepend", "inject"])
+                        weights = self.train_params.get("negative_injection_mode_weights") or {
+                            "prepend": 0.6,
+                            "append": 0.4,
+                        }
+                        mode_choice = random.choices(
+                            population=["append", "prepend"],
+                            weights=[weights["append"], weights["prepend"]],
+                            k=1
+                        )[0]
 
                     final_text, final_entities = self._inject_noise(
                         final_text,
@@ -362,7 +370,7 @@ class DatasetBuilder:
             LOGGER.debug("No noise to inject; returning base text unchanged.")
             return base_text, [list(entity) for entity in base_entities]
 
-        effective_mode = mode if mode in {"append", "prepend", "inject"} else "append"
+        effective_mode = mode if mode in {"append", "prepend"} else "append"
         insertion_sep = "" if sep is None else sep
         entities = [list(entity) for entity in base_entities]
 

@@ -27,7 +27,7 @@ if not MONGO_URI:
     raise RuntimeError("MONGO_URI must be defined in the environment")
 
 MAX_WORKERS_BUILDER = int(os.getenv("MAX_WORKERS_BUILDER", "5"))
-MAX_WORKERS_TRAINER = int(os.getenv("MAX_WORKERS_TRAINER", "2"))
+MAX_WORKERS_TRAINER = int(os.getenv("MAX_WORKERS_TRAINER", "1"))
 POLL_DELAY = float(os.getenv("POLL_DELAY", "2"))
 
 client = MongoClient(MONGO_URI)
