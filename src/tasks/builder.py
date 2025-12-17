@@ -270,7 +270,7 @@ class DatasetBuilder:
 
         detection_keys = list({
             *(self.entity_keys),
-            *(attr.get("key") for attr in attributes_defs if attr.get("key")),
+            *(attr.get("key") for attr in built_attributes if attr.get("key")),
         })
 
         resolved_text, entities = self._render_entity(
@@ -886,7 +886,7 @@ class DatasetBuilder:
                     if trimmed_end > trimmed_start:
                         entities.append([trimmed_start, trimmed_end, f"B-{nested_key}"])
 
-            cursor = end
+            cursor = raw_end  
             parts.append(value)
             last_index = match.end()
 
