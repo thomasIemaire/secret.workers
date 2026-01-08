@@ -113,7 +113,8 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
         entity_keys=entity_keys, 
         randomizers=randomizers,
         tokenizer=tokenizer,
-        negative_configurations=negative_configurations
+        negative_configurations=negative_configurations,
+        train_params=train_params,
     )
     dataset_requirements = builder.requirements
 
@@ -200,7 +201,8 @@ class DatasetBuilder:
         entity_keys: Sequence[str],
         randomizers: Sequence[Mapping[str, Any]],
         tokenizer=None,
-        negative_configurations: Optional[List[Mapping[str, Any]]] = None
+        negative_configurations: Optional[List[Mapping[str, Any]]] = None,
+        train_params: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.configuration = configuration
         self.db = db
@@ -208,6 +210,22 @@ class DatasetBuilder:
         self.randomizers = list(randomizers)
         self.tokenizer = tokenizer
         self.negative_configurations = negative_configurations or []
+        self.train_params = dict(train_params or {})
+
+        injection_mode = str(self.train_params.get("negative_injection_mode", "mixed"))
+        if injection_mode not in {"append", "prepend", "mixed"}:
+            injection_mode = "append"
+        self.negative_injection_mode = injection_mode
+        self.negative_injection_separator = str(self.train_params.get("negative_injection_separator", "\n"))
+
+        raw_probability = self.train_params.get("negative_injection_probability")
+        self.negative_injection_probability: Optional[float] = None
+        if raw_probability is not None:
+            try:
+                prob_value = max(0.0, min(1.0, float(raw_probability)))
+                self.negative_injection_probability = prob_value
+            except (TypeError, ValueError):
+                self.negative_injection_probability = None
         
         self.requirements_map: Dict[str, List[Mapping[str, Any]]] = {}
         self._visited_config_ids: Set[str] = set()
@@ -225,9 +243,6 @@ class DatasetBuilder:
 
     def generate_sample(self, is_negative: bool = False) -> Dict[str, Any]:
         target_config = self.configuration
-        if is_negative and self.negative_configurations:
-            target_config = random.choice(self.negative_configurations)
-
         context: Dict[str, Any] = {}
 
         constants = target_config.get("constants") or []
@@ -255,18 +270,54 @@ class DatasetBuilder:
 
         detection_keys = list({
             *(self.entity_keys),
-            *(attr.get("key") for attr in attributes_defs if attr.get("key")),
+            *(attr.get("key") for attr in built_attributes if attr.get("key")),
         })
 
         resolved_text, entities = self._render_entity(
             template, built_attributes, entity_keys=detection_keys
         )
 
-        resolved_text = self._apply_randomizer(resolved_text)
+        final_text = resolved_text
+        final_entities = [list(entity) for entity in entities]
 
-        original_entities = [list(entity) for entity in entities]
+        should_inject_noise = is_negative and bool(self.negative_configurations)
+        if should_inject_noise:
+            if self.negative_injection_probability is None or random.random() < self.negative_injection_probability:
+                max_noises = max(1, len(self.negative_configurations))
+                noise_count = random.randint(1, max_noises)
+                LOGGER.debug("Preparing to inject %d negative noise block(s).", noise_count)
 
-        result = {"text": resolved_text.strip(), "entities": entities}
+                for _ in range(noise_count):
+                    negative_config = random.choice(self.negative_configurations)
+                    noise_text = self._generate_negative_noise(negative_config)
+                    if not noise_text:
+                        continue
+
+                    mode_choice = self.negative_injection_mode
+                    if mode_choice == "mixed":
+                        weights = self.train_params.get("negative_injection_mode_weights") or {
+                            "prepend": 0.6,
+                            "append": 0.4,
+                        }
+                        mode_choice = random.choices(
+                            population=["append", "prepend"],
+                            weights=[weights["append"], weights["prepend"]],
+                            k=1
+                        )[0]
+
+                    final_text, final_entities = self._inject_noise(
+                        final_text,
+                        final_entities,
+                        noise_text,
+                        mode_choice,
+                        self.negative_injection_separator,
+                    )
+
+        final_text = self._apply_randomizer(final_text)
+
+        stripped_text, stripped_entities = self._strip_text_and_entities(final_text, final_entities)
+
+        result = {"text": stripped_text, "entities": stripped_entities}
 
         drop = {"prefixe"}
 
@@ -277,6 +328,144 @@ class DatasetBuilder:
             result["gliner"] = gliner_ready
 
         return result
+
+    def _generate_negative_noise(self, neg_conf: Mapping[str, Any]) -> str:
+        context: Dict[str, Any] = {}
+
+        constants = neg_conf.get("constants") or []
+        for const_def in constants:
+            const_key = const_def.get("key")
+            if not const_key:
+                continue
+
+            val, _ = self._build_dynamic_value(const_def.get("value"), context=context)
+            val = coerce_type(const_def.get("type", "string"), val)
+            context[const_key] = val
+
+        template = random.choice(neg_conf.get("formats") or [""])
+        attributes_defs = neg_conf.get("attributes") or []
+        built_attributes: List[Dict[str, Any]] = []
+
+        for attr_def in attributes_defs:
+            built_attr, extra_attrs = self._build_attribute(attr_def, context)
+            if built_attr.get("key"):
+                context[built_attr["key"]] = built_attr.get("value")
+
+            built_attributes.append(built_attr)
+            built_attributes.extend(extra_attrs)
+
+        noise_text, _ = self._render_entity(template, built_attributes, entity_keys=set())
+        cleaned = re.sub(r"\s+", " ", noise_text).strip()
+        return cleaned
+
+    def _inject_noise(
+        self,
+        base_text: str,
+        base_entities: List[List[Any]],
+        noise_text: str,
+        mode: str,
+        sep: str,
+    ) -> Tuple[str, List[List[Any]]]:
+        if not noise_text:
+            LOGGER.debug("No noise to inject; returning base text unchanged.")
+            return base_text, [list(entity) for entity in base_entities]
+
+        effective_mode = mode if mode in {"append", "prepend"} else "append"
+        insertion_sep = "" if sep is None else sep
+        entities = [list(entity) for entity in base_entities]
+
+        if effective_mode == "append":
+            final_text = f"{base_text}{insertion_sep}{noise_text}"
+            LOGGER.debug(
+                "Injected noise (mode=%s) length=%d, entities=%d, shift=%d",
+                effective_mode,
+                len(noise_text),
+                len(entities),
+                0,
+            )
+            return final_text, entities
+
+        if effective_mode == "prepend":
+            shift = len(noise_text + insertion_sep)
+            shifted_entities = [[start + shift, end + shift, label] for start, end, label in entities]
+            final_text = f"{noise_text}{insertion_sep}{base_text}"
+            LOGGER.debug(
+                "Injected noise (mode=%s) length=%d, entities=%d, shift=%d",
+                effective_mode,
+                len(noise_text),
+                len(entities),
+                shift,
+            )
+            return final_text, shifted_entities
+
+        insertion = f"{insertion_sep}{noise_text}{insertion_sep}"
+        shift = len(insertion)
+
+        candidate_positions: List[int] = []
+        for match in TOKEN_PATTERN.finditer(base_text):
+            candidate_positions.append(match.end())
+        candidate_positions.extend([m.start() for m in re.finditer(r"\s", base_text)])
+
+        def _is_inside_entity(pos: int) -> bool:
+            for start, end, _ in entities:
+                if start < pos < end:
+                    return True
+            return False
+
+        candidate_positions = [pos for pos in candidate_positions if not _is_inside_entity(pos)]
+        if not candidate_positions:
+            for _ in range(5):
+                pos = random.randint(0, len(base_text)) if base_text else 0
+                if not _is_inside_entity(pos):
+                    candidate_positions.append(pos)
+                    break
+        pos = random.choice(candidate_positions) if candidate_positions else len(base_text)
+
+        shifted_entities: List[List[Any]] = []
+        for start, end, label in entities:
+            if start >= pos:
+                shifted_entities.append([start + shift, end + shift, label])
+            elif start < pos < end:
+                shifted_entities.append([start, end + shift, label])
+            else:
+                shifted_entities.append([start, end, label])
+
+        final_text = f"{base_text[:pos]}{insertion}{base_text[pos:]}"
+        LOGGER.debug(
+            "Injected noise (mode=%s) length=%d, entities=%d, shift=%d at pos=%d",
+            effective_mode,
+            len(noise_text),
+            len(entities),
+            shift,
+            pos,
+        )
+        return final_text, shifted_entities
+
+    def _strip_text_and_entities(
+        self, text: str, entities: List[List[Any]]
+    ) -> Tuple[str, List[List[Any]]]:
+        leading_trim = len(text) - len(text.lstrip())
+        trailing_trim = len(text) - len(text.rstrip())
+        stripped_text = text.strip()
+
+        if leading_trim == 0 and trailing_trim == 0:
+            return stripped_text, entities
+
+        adjusted_entities: List[List[Any]] = []
+        for start, end, label in entities:
+            new_start = max(0, start - leading_trim)
+            new_end = max(0, end - leading_trim)
+            new_end = min(new_end, len(stripped_text))
+            if new_end > new_start:
+                adjusted_entities.append([new_start, new_end, label])
+
+        LOGGER.debug(
+            "Stripped text leading=%d trailing=%d; entities adjusted=%d",
+            leading_trim,
+            trailing_trim,
+            len(adjusted_entities),
+        )
+        return stripped_text, adjusted_entities
 
     def _tokenize_for_gliner(self, text: str) -> Tuple[List[str], List[Tuple[int, int]]]:
         tokens: List[str] = []
@@ -697,7 +886,7 @@ class DatasetBuilder:
                     if trimmed_end > trimmed_start:
                         entities.append([trimmed_start, trimmed_end, f"B-{nested_key}"])
 
-            cursor = end
+            cursor = raw_end  
             parts.append(value)
             last_index = match.end()
 
